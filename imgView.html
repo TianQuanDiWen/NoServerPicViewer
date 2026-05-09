@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📷 本地图片浏览器（虚拟滚动+缩放+排序筛选）</title>
+    <style>
+        :root {
+            --bg: #f5f5f7;
+            --card-bg: #ffffff;
+            --text: #1d1d1f;
+            --text-secondary: #6e6e73;
+            --border: #e5e5ea;
+            --accent: #0071e3;
+            --accent-hover: #0077ed;
+            --shadow: 0 2px 12px rgba(0,0,0,0.08);
+            --shadow-hover: 0 8px 30px rgba(0,0,0,0.14);
+            --tag-bg: #f0f0f5;
+            --badge-folder: #f0f4ff; --badge-folder-text: #3b5ccc;
+            --badge-size: #f0faf5; --badge-size-text: #2d8a56;
+            --badge-date: #fdf6f0; --badge-date-text: #b87a3a;
+            --sidebar-bg: #fafafa;
+            --sidebar-width: 260px;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root { --bg: #1c1c1e; --card-bg: #2c2c2e; --text: #f5f5f7; --text-secondary: #a1a1a6; --border: #3a3a3c; --accent: #4da6ff; --tag-bg: #3a3a3c; --badge-folder: #1e2a45; --badge-folder-text: #8aadff; --badge-size: #1a3028; --badge-size-text: #5ec48a; --badge-date: #2e2418; --badge-date-text: #d4a05a; --sidebar-bg: #252528; }
+        }
+        * { margin:0; padding:0; box-sizing:border-box; }
+        html, body { height: 100%; overflow: hidden; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; background: var(--bg); color: var(--text); display:flex; }
+        .sidebar {
+            width: var(--sidebar-width); min-width: var(--sidebar-width);
+            background: var(--sidebar-bg); border-right: 1px solid var(--border);
+            display: flex; flex-direction: column; height: 100%;
+            overflow-y: auto; overflow-x: hidden;
+            z-index: 50; transition: transform 0.3s;
+        }
+        .sidebar-header { padding: 14px 16px; font-weight: 700; font-size: 1rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+        .tree-container { flex: 1; padding: 8px 0; overflow-y: auto; }
+        .tree-item {
+            display: flex; align-items: center; padding: 4px 12px; cursor: pointer;
+            font-size: 0.88rem; border-radius: 6px; margin: 1px 6px; transition: background 0.15s;
+            white-space: nowrap; user-select: none;
+        }
+        .tree-item:hover { background: var(--tag-bg); }
+        .tree-item.active { background: var(--accent); color: #fff; }
+        .tree-item .folder-icon { font-size: 1rem; margin-right: 4px; flex-shrink: 0; }
+        .tree-item .folder-name { overflow: hidden; text-overflow: ellipsis; flex:1; min-width:0; }
+        .tree-item .count { font-size: 0.7rem; opacity: 0.7; margin-left: 4px; }
+        .tree-children { padding-left: 12px; }
+        .tree-toggle { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; margin-right: 2px; font-size: 0.7rem; }
+        .tree-toggle.collapsed::before { content: '▶'; }
+        .tree-toggle.expanded::before { content: '▼'; }
+        .main-area { flex: 1; display: flex; flex-direction: column; height: 100%; min-width: 0; }
+        .navbar {
+            background: var(--card-bg);
+            border-bottom:1px solid var(--border); padding:8px 16px;
+            display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+            box-shadow:0 1px 4px rgba(0,0,0,0.04);
+            flex-shrink: 0;
+        }
+        .logo { font-weight:700; font-size:1rem; white-space:nowrap; display:flex; align-items:center; gap:4px; }
+        .btn { padding:5px 12px; border-radius:8px; border:1px solid var(--border); background:var(--card-bg); color:var(--text); cursor:pointer; font-size:0.78rem; font-weight:500; display:inline-flex; align-items:center; gap:4px; transition:all 0.2s; white-space:nowrap; }
+        .btn:hover { background:var(--tag-bg); }
+        .btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+        .btn.primary:hover { background:var(--accent-hover); }
+        .search-wrapper { flex:1 1 auto; min-width:140px; max-width:280px; position:relative; }
+        .search-wrapper input { width:100%; padding:5px 10px 5px 30px; border-radius:20px; border:1.5px solid var(--border); background:var(--bg); color:var(--text); outline:none; font-size:0.8rem; }
+        .search-wrapper input:focus { border-color:var(--accent); }
+        .search-icon { position:absolute; left:10px; top:50%; transform:translateY(-50%); font-size:0.75rem; opacity:0.5; pointer-events:none; }
+        .filter-bar {
+            display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+            width:100%; margin-top:2px;
+        }
+        .filter-bar select, .filter-bar input[type="date"] {
+            padding:4px 8px; border-radius:6px; border:1px solid var(--border);
+            background:var(--bg); color:var(--text); font-size:0.75rem;
+        }
+        .stats { display:flex; gap:5px; }
+        .stat { font-size:0.7rem; padding:2px 6px; border-radius:10px; background:var(--tag-bg); }
+        .current-folder-badge {
+            background: var(--accent); color: #fff; padding: 3px 10px; border-radius: 12px;
+            font-size: 0.75rem; font-weight: 500; margin: 0 4px; white-space: nowrap;
+            overflow: hidden; text-overflow: ellipsis; max-width: 200px;
+        }
+        .scroll-container {
+            flex:1; overflow-y:auto; overflow-x:hidden; position:relative;
+            -webkit-overflow-scrolling: touch;
+        }
+        .scroll-placeholder { position:relative; width:100%; }
+        .visible-content { position:absolute; top:0; left:0; width:100%; pointer-events:none; }
+        .visible-content > * { pointer-events:auto; }
+        .image-card {
+            background:var(--card-bg); border-radius:12px; overflow:hidden;
+            border:1px solid var(--border); box-shadow:var(--shadow); cursor:pointer;
+            transition:transform 0.2s, box-shadow 0.2s; display:flex; flex-direction:column;
+            position:absolute;
+        }
+        .image-card:hover { transform:translateY(-3px); box-shadow:var(--shadow-hover); }
+        .img-container {
+            width:100%; aspect-ratio:4/3; background:#e0e0e5;
+            position:relative; overflow:hidden;
+        }
+        .img-container img {
+            width:100%; height:100%; object-fit:cover; display:block;
+            opacity:0; transition: opacity 0.3s;
+        }
+        .img-container img.loaded { opacity:1; }
+        .card-info { padding:6px 10px 10px; display:flex; flex-direction:column; gap:3px; }
+        .file-name { font-weight:600; font-size:0.78rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .meta-tag { font-size:0.65rem; padding:2px 5px; border-radius:4px; display:inline-flex; align-items:center; gap:2px; }
+        .meta-tag.folder { background:var(--badge-folder); color:var(--badge-folder-text); max-width:130px; overflow:hidden; text-overflow:ellipsis; }
+        .meta-tag.size { background:var(--badge-size); color:var(--badge-size-text); }
+        .meta-tag.date { background:var(--badge-date); color:var(--badge-date-text); }
+
+        /* 灯箱 */
+        .lightbox {
+            position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,0.9);
+            display:flex; flex-direction:column; align-items:center; justify-content:center;
+        }
+        .lightbox-img-wrapper {
+            max-width:92vw; max-height:85vh; display:flex; align-items:center; justify-content:center;
+            transition: transform 0.1s ease-out; overflow: hidden;
+        }
+        .lightbox-img-wrapper img {
+            max-width:100%; max-height:85vh; border-radius:8px; object-fit:contain;
+            transition: transform 0.1s ease-out;
+        }
+        .lightbox .close, .lightbox .nav {
+            position:fixed; background:rgba(255,255,255,0.2); border:none; color:#fff;
+            font-size:1.4rem; width:40px; height:40px; border-radius:50%; cursor:pointer;
+            display:flex; align-items:center; justify-content:center; z-index:1010;
+        }
+        .lightbox .close { top:16px; right:16px; }
+        .lightbox .nav.prev { left:12px; top:50%; transform:translateY(-50%); }
+        .lightbox .nav.next { right:12px; top:50%; transform:translateY(-50%); }
+        .lightbox-controls {
+            position:fixed; bottom:20px; display:flex; gap:10px; z-index:1010;
+            background:rgba(0,0,0,0.5); padding:6px 16px; border-radius:30px;
+        }
+        .lightbox-controls .btn {
+            background:rgba(255,255,255,0.2); color:#fff; border:none; font-size:0.8rem;
+            padding:5px 12px; border-radius:20px; cursor:pointer;
+        }
+        .toast {
+            position:fixed; bottom:20px; left:50%; transform:translateX(-50%) translateY(100px);
+            background:#333; color:#fff; padding:8px 20px; border-radius:20px; font-size:0.85rem;
+            z-index:2000; transition:0.3s;
+        }
+        .toast.show { transform:translateX(-50%) translateY(0); }
+
+        @media (max-width: 768px) {
+            .sidebar { position: fixed; left:0; top:0; height:100%; transform: translateX(-100%); z-index: 200; }
+            .sidebar.open { transform: translateX(0); box-shadow: 4px 0 20px rgba(0,0,0,0.3); }
+            .sidebar-toggle { display: inline-flex !important; }
+            .main-area { width: 100%; }
+        }
+        .sidebar-toggle { display: none; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 5px 8px; cursor: pointer; font-size: 1.1rem; }
+    </style>
+</head>
+<body>
+    <div id="sidebarOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:199;display:none;" onclick="toggleSidebar()"></div>
+
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header"><span>📁 文件夹</span></div>
+        <div class="tree-container" id="treeContainer"></div>
+    </aside>
+
+    <div class="main-area">
+        <nav class="navbar">
+            <button class="btn sidebar-toggle" id="sidebarToggleBtn" onclick="toggleSidebar()" style="display:none;">☰</button>
+            <span class="logo">🖼️ 图片浏览器</span>
+            <button class="btn primary" id="selectFolderBtn">📂 选择本地文件夹</button>
+            <div class="search-wrapper">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="searchInput" placeholder="搜索图片名称...">
+            </div>
+            <div class="stats">
+                <span class="stat">📷 <span id="statImages">0</span></span>
+                <span class="stat">📁 <span id="statFolders">0</span></span>
+                <span class="stat">💾 <span id="statSize">0 B</span></span>
+            </div>
+            <span class="current-folder-badge" id="currentFolderBadge" style="display:none;"></span>
+            <div class="filter-bar">
+                <select id="sortSelect">
+                    <option value="name-asc">名称 ↑</option>
+                    <option value="name-desc">名称 ↓</option>
+                    <option value="date-desc">时间 ↓</option>
+                    <option value="date-asc">时间 ↑</option>
+                </select>
+                <input type="date" id="filterDateStart" title="开始日期">
+                <input type="date" id="filterDateEnd" title="结束日期">
+                <button class="btn" id="applyFilterBtn">筛选</button>
+                <button class="btn" id="clearFilterBtn">清除</button>
+            </div>
+        </nav>
+        
+        <div class="scroll-container" id="scrollContainer">
+            <div class="scroll-placeholder" id="scrollPlaceholder"></div>
+            <div class="visible-content" id="visibleContent"></div>
+        </div>
+    </div>
+
+    <div class="lightbox" id="lightbox" style="display:none;">
+        <button class="close" id="lightboxClose">✕</button>
+        <button class="nav prev" id="lightboxPrev">◀</button>
+        <button class="nav next" id="lightboxNext">▶</button>
+        <div class="lightbox-img-wrapper" id="lightboxImgWrapper">
+            <img id="lightboxImg" src="" alt="">
+        </div>
+        <div class="lightbox-controls">
+            <button class="btn" id="lightboxZoomIn">🔍+</button>
+            <button class="btn" id="lightboxZoomOut">🔍-</button>
+            <button class="btn" id="lightboxReset">↺ 原始</button>
+            <button class="btn" id="lightboxFullscreen">⛶ 全屏</button>
+            <button class="btn" id="lightboxCopy">📋 复制图片</button>
+        </div>
+    </div>
+    <div class="toast" id="toast"></div>
+
+    <script>
+        (() => {
+            const treeContainer = document.getElementById('treeContainer');
+            const searchInput = document.getElementById('searchInput');
+            const statImages = document.getElementById('statImages');
+            const statFolders = document.getElementById('statFolders');
+            const statSize = document.getElementById('statSize');
+            const selectFolderBtn = document.getElementById('selectFolderBtn');
+            const lightbox = document.getElementById('lightbox');
+            const lightboxImg = document.getElementById('lightboxImg');
+            const lightboxImgWrapper = document.getElementById('lightboxImgWrapper');
+            const lightboxClose = document.getElementById('lightboxClose');
+            const lightboxPrev = document.getElementById('lightboxPrev');
+            const lightboxNext = document.getElementById('lightboxNext');
+            const lightboxZoomIn = document.getElementById('lightboxZoomIn');
+            const lightboxZoomOut = document.getElementById('lightboxZoomOut');
+            const lightboxReset = document.getElementById('lightboxReset');
+            const lightboxFullscreen = document.getElementById('lightboxFullscreen');
+            const lightboxCopy = document.getElementById('lightboxCopy');
+            const toast = document.getElementById('toast');
+            const currentFolderBadge = document.getElementById('currentFolderBadge');
+            const scrollContainer = document.getElementById('scrollContainer');
+            const scrollPlaceholder = document.getElementById('scrollPlaceholder');
+            const visibleContent = document.getElementById('visibleContent');
+
+            const sortSelect = document.getElementById('sortSelect');
+            const filterDateStart = document.getElementById('filterDateStart');
+            const filterDateEnd = document.getElementById('filterDateEnd');
+            const applyFilterBtn = document.getElementById('applyFilterBtn');
+            const clearFilterBtn = document.getElementById('clearFilterBtn');
+
+            let allImages = [];
+            let folderTree = null;
+            let activeFolder = null;
+            let currentDisplayImages = [];
+            const imageExtensions = new Set(['jpg','jpeg','png','gif','webp','bmp','svg','tiff','tif','avif','ico','heic','heif','jfif']);
+            
+            let rowHeight = 260;
+            let columnCount = 4;
+            let containerWidth = 0;
+            let gap = 12;
+            let renderedStartIndex = 0;
+            let renderedEndIndex = 0;
+            let resizeObserver = null;
+            let ticking = false;
+            let currentScale = 1;
+            let currentSort = 'name-asc';
+
+            function formatSize(bytes) {
+                if (!bytes) return '0 B';
+                const u = ['B','KB','MB','GB']; let i=0;
+                while(bytes>=1024 && i<3){bytes/=1024;i++;}
+                return bytes.toFixed(i?1:0)+' '+u[i];
+            }
+            function formatDate(ms) {
+                if(!ms) return '';
+                const d=new Date(ms);
+                return d.getFullYear()+'-'+(d.getMonth()+1).toString().padStart(2,'0')+'-'+d.getDate().toString().padStart(2,'0');
+            }
+            function escapeHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+            function showToast(msg){
+                toast.textContent=msg; toast.classList.add('show');
+                clearTimeout(window._toastTimer);
+                window._toastTimer = setTimeout(()=>toast.classList.remove('show'),2000);
+            }
+            function normalizePath(p) {
+                if (!p) return '';
+                return p.replace(/\\/g, '/').trim().replace(/\/+$/, '');
+            }
+
+            window.toggleSidebar = function() {
+                const sidebar = document.getElementById('sidebar');
+                const overlay = document.getElementById('sidebarOverlay');
+                if (sidebar.classList.contains('open')) {
+                    sidebar.classList.remove('open');
+                    overlay.style.display = 'none';
+                } else {
+                    sidebar.classList.add('open');
+                    overlay.style.display = 'block';
+                }
+            };
+
+            function buildFolderTree(images) {
+                const root = { name: '全部图片', path: null, children: {}, images: [], totalImages: 0 };
+                images.forEach(img => {
+                    const folder = normalizePath(img.folder || '');
+                    if (!folder) {
+                        root.images.push(img);
+                        root.totalImages++;
+                        return;
+                    }
+                    const parts = folder.split('/');
+                    let node = root;
+                    parts.forEach((part, idx) => {
+                        const currentPath = parts.slice(0, idx+1).join('/');
+                        if (!node.children[part]) {
+                            node.children[part] = {
+                                name: part,
+                                path: currentPath,
+                                children: {},
+                                images: [],
+                                totalImages: 0
+                            };
+                        }
+                        node = node.children[part];
+                        node.totalImages++;
+                    });
+                    node.images.push(img);
+                });
+                return root;
+            }
+
+            function renderTree() {
+                treeContainer.innerHTML = '';
+                if (!folderTree) {
+                    treeContainer.innerHTML = '<div style="padding:20px;color:var(--text-secondary);">暂无文件夹</div>';
+                    return;
+                }
+                function createTreeNode(node, level = 0) {
+                    const hasChildren = Object.keys(node.children).length > 0;
+                    const itemDiv = document.createElement('div');
+                    itemDiv.className = 'tree-item';
+                    itemDiv.dataset.path = node.path || '__root__';
+                    if (activeFolder === node.path) itemDiv.classList.add('active');
+                    if (level > 0) itemDiv.style.paddingLeft = (12 + level * 14) + 'px';
+                    const toggleSpan = document.createElement('span');
+                    toggleSpan.className = 'tree-toggle';
+                    if (hasChildren) {
+                        toggleSpan.classList.add('expanded');
+                        toggleSpan.onclick = (e) => {
+                            e.stopPropagation();
+                            const childrenDiv = itemDiv.nextElementSibling;
+                            if (childrenDiv && childrenDiv.classList.contains('tree-children')) {
+                                if (childrenDiv.style.display === 'none') {
+                                    childrenDiv.style.display = 'block';
+                                    toggleSpan.classList.remove('collapsed');
+                                    toggleSpan.classList.add('expanded');
+                                } else {
+                                    childrenDiv.style.display = 'none';
+                                    toggleSpan.classList.remove('expanded');
+                                    toggleSpan.classList.add('collapsed');
+                                }
+                            }
+                        };
+                    }
+                    itemDiv.appendChild(toggleSpan);
+                    const icon = document.createElement('span');
+                    icon.className = 'folder-icon';
+                    icon.textContent = node.path === null ? '🏠' : '📁';
+                    itemDiv.appendChild(icon);
+                    const nameSpan = document.createElement('span');
+                    nameSpan.className = 'folder-name';
+                    nameSpan.textContent = node.path === null ? '全部图片' : node.name;
+                    itemDiv.appendChild(nameSpan);
+                    const countSpan = document.createElement('span');
+                    countSpan.className = 'count';
+                    countSpan.textContent = node.totalImages;
+                    itemDiv.appendChild(countSpan);
+                    itemDiv.onclick = (e) => {
+                        if (hasChildren) {
+                            const childrenDiv = itemDiv.nextElementSibling;
+                            if (childrenDiv && childrenDiv.style.display === 'none') {
+                                childrenDiv.style.display = 'block';
+                                toggleSpan.classList.remove('collapsed');
+                                toggleSpan.classList.add('expanded');
+                            }
+                        }
+                        setActiveFolder(node.path);
+                    };
+                    return itemDiv;
+                }
+                function renderChildren(container, node, level) {
+                    const itemDiv = createTreeNode(node, level);
+                    container.appendChild(itemDiv);
+                    if (Object.keys(node.children).length > 0) {
+                        const childrenDiv = document.createElement('div');
+                        childrenDiv.className = 'tree-children';
+                        Object.values(node.children).forEach(child => renderChildren(childrenDiv, child, level + 1));
+                        container.appendChild(childrenDiv);
+                    }
+                }
+                const rootItemDiv = createTreeNode(folderTree, 0);
+                treeContainer.appendChild(rootItemDiv);
+                const rootChildrenDiv = document.createElement('div');
+                rootChildrenDiv.className = 'tree-children';
+                Object.values(folderTree.children).forEach(child => renderChildren(rootChildrenDiv, child, 1));
+                treeContainer.appendChild(rootChildrenDiv);
+            }
+
+            function setActiveFolder(path) {
+                const normalized = path === null ? null : normalizePath(path || '');
+                activeFolder = normalized;
+                searchInput.value = '';
+                scrollContainer.scrollTop = 0;
+                updateDisplay();
+                if (window.innerWidth <= 768) {
+                    document.getElementById('sidebar').classList.remove('open');
+                    document.getElementById('sidebarOverlay').style.display = 'none';
+                }
+            }
+
+            function imageBelongsToFolder(img, folderPath) {
+                if (folderPath === null) return true;
+                const imgFolder = normalizePath(img.folder || '');
+                if (folderPath === '') return imgFolder === '';
+                return imgFolder === folderPath || imgFolder.startsWith(folderPath + '/');
+            }
+
+            function measureRowHeight() {
+                const tempCard = createCardElement({ url: '', name: '测量用', folder: '测试', size: 1024, modified: Date.now() }, 0);
+                tempCard.style.position = 'fixed';
+                tempCard.style.visibility = 'hidden';
+                tempCard.style.left = '0';
+                tempCard.style.top = '0';
+                const colWidth = (containerWidth - gap * (columnCount - 1)) / columnCount;
+                tempCard.style.width = colWidth + 'px';
+                document.body.appendChild(tempCard);
+                const height = tempCard.getBoundingClientRect().height;
+                document.body.removeChild(tempCard);
+                return height || 260;
+            }
+
+            function updateLayoutParams() {
+                const oldWidth = containerWidth;
+                containerWidth = scrollContainer.clientWidth;
+                if (containerWidth <= 0) return;
+                const minColWidth = 180;
+                columnCount = Math.max(1, Math.floor((containerWidth + gap) / (minColWidth + gap)));
+                if (containerWidth !== oldWidth || rowHeight === 260) {
+                    rowHeight = measureRowHeight();
+                }
+            }
+
+            function getTotalHeight() {
+                if (currentDisplayImages.length === 0) return 0;
+                const rows = Math.ceil(currentDisplayImages.length / columnCount);
+                return rows * rowHeight + (rows - 1) * gap;
+            }
+
+            function renderVisibleItems() {
+                if (!scrollContainer || currentDisplayImages.length === 0) {
+                    visibleContent.innerHTML = '';
+                    scrollPlaceholder.style.height = '0px';
+                    return;
+                }
+                const scrollTop = scrollContainer.scrollTop;
+                const viewHeight = scrollContainer.clientHeight;
+                const totalItems = currentDisplayImages.length;
+                const startRow = Math.max(0, Math.floor(scrollTop / (rowHeight + gap)) - 1);
+                const endRow = Math.min(Math.ceil(totalItems / columnCount), Math.ceil((scrollTop + viewHeight) / (rowHeight + gap)) + 1);
+                const startIndex = startRow * columnCount;
+                const endIndex = Math.min(totalItems, endRow * columnCount);
+                if (startIndex === renderedStartIndex && endIndex === renderedEndIndex) return;
+                renderedStartIndex = startIndex;
+                renderedEndIndex = endIndex;
+                visibleContent.innerHTML = '';
+                for (let i = startIndex; i < endIndex; i++) {
+                    const img = currentDisplayImages[i];
+                    const row = Math.floor(i / columnCount);
+                    const col = i % columnCount;
+                    const colWidth = (containerWidth - gap * (columnCount - 1)) / columnCount;
+                    const left = col * (colWidth + gap);
+                    const top = row * (rowHeight + gap);
+                    const card = createCardElement(img, i);
+                    card.style.width = colWidth + 'px';
+                    card.style.left = left + 'px';
+                    card.style.top = top + 'px';
+                    visibleContent.appendChild(card);
+                }
+                scrollPlaceholder.style.height = getTotalHeight() + 'px';
+            }
+
+            function createCardElement(img, globalIndex) {
+                const card = document.createElement('div');
+                card.className = 'image-card';
+                const imgContainer = document.createElement('div');
+                imgContainer.className = 'img-container';
+                const imageEl = document.createElement('img');
+                imageEl.dataset.src = img.url;
+                imageEl.alt = img.name;
+                imageEl.style.width = '100%';
+                imageEl.style.height = '100%';
+                imgContainer.appendChild(imageEl);
+                const info = document.createElement('div');
+                info.className = 'card-info';
+                const folderShort = (normalizePath(img.folder || '') || '根目录').split('/').pop() || '根目录';
+                info.innerHTML = `
+                    <div class="file-name" title="${escapeHtml(img.name)}">${escapeHtml(img.name)}</div>
+                    <div><span class="meta-tag folder">📁 ${escapeHtml(folderShort)}</span>
+                    <span class="meta-tag size">📏 ${formatSize(img.size)}</span></div>
+                    <div><span class="meta-tag date">🕒 ${formatDate(img.modified)}</span></div>`;
+                card.appendChild(imgContainer);
+                card.appendChild(info);
+                card.addEventListener('click', () => {
+                    openLightbox(globalIndex, currentDisplayImages);
+                });
+                return card;
+            }
+
+            let lazyObserver = null;
+            function initLazyObserver() {
+                if (lazyObserver) lazyObserver.disconnect();
+                lazyObserver = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            const img = entry.target;
+                            const src = img.dataset.src;
+                            if (src && !img.src) {
+                                img.src = src;
+                                img.onload = () => img.classList.add('loaded');
+                                img.onerror = () => { img.style.background = '#f0e0e0'; };
+                            }
+                            lazyObserver.unobserve(img);
+                        }
+                    });
+                }, { root: scrollContainer, rootMargin: '200px', threshold: 0.01 });
+            }
+
+            function observeVisibleImages() {
+                if (!lazyObserver) initLazyObserver();
+                const imgs = visibleContent.querySelectorAll('img[data-src]');
+                imgs.forEach(img => lazyObserver.observe(img));
+            }
+
+            function onScroll() {
+                if (!ticking) {
+                    requestAnimationFrame(() => {
+                        renderVisibleItems();
+                        observeVisibleImages();
+                        ticking = false;
+                    });
+                    ticking = true;
+                }
+            }
+
+            function updateDisplay() {
+                let filtered = [...allImages];
+                if (activeFolder !== null) {
+                    filtered = filtered.filter(img => imageBelongsToFolder(img, activeFolder));
+                }
+                const q = searchInput.value.trim().toLowerCase();
+                if (q) {
+                    filtered = filtered.filter(img => img.name.toLowerCase().includes(q));
+                }
+                // 日期筛选
+                const startVal = filterDateStart.value;
+                const endVal = filterDateEnd.value;
+                if (startVal || endVal) {
+                    const start = startVal ? new Date(startVal).getTime() : null;
+                    const end = endVal ? new Date(endVal + 'T23:59:59.999').getTime() : null;
+                    filtered = filtered.filter(img => {
+                        const time = img.modified || 0;
+                        if (start && time < start) return false;
+                        if (end && time > end) return false;
+                        return true;
+                    });
+                }
+                // 排序
+                const [sortKey, sortOrder] = currentSort.split('-');
+                filtered.sort((a, b) => {
+                    let valA, valB;
+                    if (sortKey === 'name') {
+                        valA = a.name.toLowerCase();
+                        valB = b.name.toLowerCase();
+                    } else if (sortKey === 'date') {
+                        valA = a.modified || 0;
+                        valB = b.modified || 0;
+                    }
+                    if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
+                    if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
+                    return 0;
+                });
+
+                currentDisplayImages = filtered;
+                statImages.textContent = filtered.length;
+                statFolders.textContent = new Set(filtered.map(i=>normalizePath(i.folder||'根目录'))).size;
+                statSize.textContent = formatSize(filtered.reduce((s,i)=>s+(i.size||0),0));
+                if (activeFolder === null) {
+                    currentFolderBadge.style.display = 'none';
+                } else {
+                    currentFolderBadge.style.display = 'inline-block';
+                    currentFolderBadge.textContent = `📂 ${activeFolder || '根目录'}`;
+                }
+                document.querySelectorAll('.tree-item').forEach(el => el.classList.remove('active'));
+                if (activeFolder === null) {
+                    const rootEl = document.querySelector('.tree-item[data-path="__root__"]');
+                    if (rootEl) rootEl.classList.add('active');
+                } else {
+                    const activeEl = document.querySelector(`.tree-item[data-path="${CSS.escape(activeFolder)}"]`);
+                    if (activeEl) activeEl.classList.add('active');
+                }
+                updateLayoutParams();
+                renderedStartIndex = -1;
+                renderedEndIndex = -1;
+                renderVisibleItems();
+                observeVisibleImages();
+            }
+
+            // ---------- 灯箱与缩放 ----------
+            let currentLightboxList = [];
+            let currentIndex = -1;
+
+            function openLightbox(idx, list){
+                if(!list.length) return;
+                currentLightboxList = list;
+                currentIndex = idx;
+                const img = list[idx];
+                lightboxImg.src = img.url;
+                lightbox.style.display = 'flex';
+                lightboxPrev.style.display = list.length>1?'flex':'none';
+                lightboxNext.style.display = list.length>1?'flex':'none';
+                resetZoom();
+            }
+
+            function closeLightbox(){ 
+                lightbox.style.display='none'; 
+                lightboxImg.src=''; 
+                resetZoom();
+            }
+
+            function navLightbox(dir){
+                if(!currentLightboxList.length) return;
+                let idx = currentIndex + dir;
+                if(idx<0) idx = currentLightboxList.length-1;
+                if(idx>=currentLightboxList.length) idx=0;
+                openLightbox(idx, currentLightboxList);
+            }
+
+            function resetZoom() {
+                currentScale = 1;
+                lightboxImgWrapper.style.transform = `scale(1)`;
+            }
+
+            function zoomIn() {
+                currentScale = Math.min(currentScale + 0.25, 5);
+                lightboxImgWrapper.style.transform = `scale(${currentScale})`;
+            }
+
+            function zoomOut() {
+                currentScale = Math.max(currentScale - 0.25, 0.25);
+                lightboxImgWrapper.style.transform = `scale(${currentScale})`;
+            }
+
+            // 全屏切换
+            function toggleFullscreen() {
+                if (!document.fullscreenElement) {
+                    lightbox.requestFullscreen().catch(err => {
+                        showToast('全屏失败：' + err.message);
+                    });
+                } else {
+                    document.exitFullscreen();
+                }
+            }
+
+            // 复制当前图片到剪贴板
+            async function copyImageToClipboard() {
+                if (currentLightboxList.length === 0) return;
+                const img = currentLightboxList[currentIndex];
+                try {
+                    const response = await fetch(img.url);
+                    const blob = await response.blob();
+                    await navigator.clipboard.write([
+                        new ClipboardItem({ [blob.type]: blob })
+                    ]);
+                    showToast('✅ 图片已复制到剪贴板');
+                } catch (err) {
+                    showToast('❌ 复制失败：' + err.message);
+                }
+            }
+
+            // 事件绑定
+            lightboxClose.addEventListener('click', closeLightbox);
+            lightboxPrev.addEventListener('click', (e)=>{e.stopPropagation(); navLightbox(-1);});
+            lightboxNext.addEventListener('click', (e)=>{e.stopPropagation(); navLightbox(1);});
+            lightbox.addEventListener('click', function(e){ if(e.target===lightbox) closeLightbox(); });
+            
+            lightboxZoomIn.addEventListener('click', (e)=>{e.stopPropagation(); zoomIn();});
+            lightboxZoomOut.addEventListener('click', (e)=>{e.stopPropagation(); zoomOut();});
+            lightboxReset.addEventListener('click', (e)=>{e.stopPropagation(); resetZoom();});
+            lightboxFullscreen.addEventListener('click', (e)=>{e.stopPropagation(); toggleFullscreen();});
+            lightboxCopy.addEventListener('click', (e)=>{e.stopPropagation(); copyImageToClipboard();});
+
+            lightboxImgWrapper.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                if (e.deltaY < 0) zoomIn();
+                else zoomOut();
+            }, { passive: false });
+
+            document.addEventListener('keydown', e=>{
+                if(lightbox.style.display==='flex'){
+                    if(e.key==='Escape') {
+                        if (document.fullscreenElement) {
+                            document.exitFullscreen();
+                        } else {
+                            closeLightbox();
+                        }
+                    }
+                    if(e.key==='ArrowLeft') { e.preventDefault(); navLightbox(-1); }
+                    if(e.key==='ArrowRight') { e.preventDefault(); navLightbox(1); }
+                    if(e.key==='+' || e.key==='=') { e.preventDefault(); zoomIn(); }
+                    if(e.key==='-') { e.preventDefault(); zoomOut(); }
+                    if(e.key==='0') { e.preventDefault(); resetZoom(); }
+                    if(e.key==='f' || e.key==='F') { e.preventDefault(); toggleFullscreen(); }
+                }
+            });
+
+            // 全屏变化时更新按钮文字（可选）
+            document.addEventListener('fullscreenchange', () => {
+                if (document.fullscreenElement) {
+                    lightboxFullscreen.textContent = '⛶ 退出全屏';
+                } else {
+                    lightboxFullscreen.textContent = '⛶ 全屏';
+                }
+            });
+
+            // 排序与筛选
+            sortSelect.addEventListener('change', () => {
+                currentSort = sortSelect.value;
+                updateDisplay();
+            });
+
+            applyFilterBtn.addEventListener('click', () => {
+                updateDisplay();
+            });
+
+            clearFilterBtn.addEventListener('click', () => {
+                filterDateStart.value = '';
+                filterDateEnd.value = '';
+                updateDisplay();
+            });
+
+            searchInput.addEventListener('input', () => {
+                scrollContainer.scrollTop = 0;
+                updateDisplay();
+            });
+
+            async function handleSelectFolder() {
+                try {
+                    const dirHandle = await window.showDirectoryPicker();
+                    const images = [];
+                    async function scanDirHandle(handle, pathPrefix = '') {
+                        const rawPath = pathPrefix ? pathPrefix + '/' + handle.name : handle.name;
+                        const currentPath = normalizePath(rawPath);
+                        for await (const entry of handle.values()) {
+                            if (entry.kind === 'file') {
+                                const ext = entry.name.split('.').pop().toLowerCase();
+                                if (imageExtensions.has(ext)) {
+                                    const file = await entry.getFile();
+                                    images.push({
+                                        url: URL.createObjectURL(file),
+                                        name: entry.name,
+                                        folder: currentPath,
+                                        size: file.size,
+                                        modified: file.lastModified
+                                    });
+                                }
+                            } else if (entry.kind === 'directory') {
+                                await scanDirHandle(entry, currentPath);
+                            }
+                        }
+                    }
+                    await scanDirHandle(dirHandle);
+                    allImages.forEach(i=> URL.revokeObjectURL(i.url));
+                    allImages = images;
+                    folderTree = buildFolderTree(allImages);
+                    activeFolder = null;
+                    searchInput.value = '';
+                    renderTree();
+                    scrollContainer.scrollTop = 0;
+                    updateDisplay();
+                    showToast(`✅ 已加载 ${allImages.length} 张图片`);
+                } catch (err) {
+                    if (err.name !== 'AbortError') {
+                        showToast('❌ 无法读取文件夹：' + err.message);
+                    }
+                }
+            }
+            selectFolderBtn.addEventListener('click', handleSelectFolder);
+
+            if (window.ResizeObserver) {
+                resizeObserver = new ResizeObserver(() => {
+                    updateLayoutParams();
+                    renderedStartIndex = -1;
+                    renderedEndIndex = -1;
+                    renderVisibleItems();
+                    observeVisibleImages();
+                });
+                resizeObserver.observe(scrollContainer);
+            }
+
+            scrollContainer.addEventListener('scroll', onScroll, { passive: true });
+            window.addEventListener('resize', () => {
+                updateLayoutParams();
+                renderedStartIndex = -1;
+                renderedEndIndex = -1;
+                renderVisibleItems();
+                observeVisibleImages();
+            });
+
+            initLazyObserver();
+            folderTree = null;
+            renderTree();
+            updateDisplay();
+        })();
+    </script>
+</body>
+</html>
