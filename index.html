@@ -68,13 +68,9 @@
         .search-wrapper input { width:100%; padding:5px 10px 5px 30px; border-radius:20px; border:1.5px solid var(--border); background:var(--bg); color:var(--text); outline:none; font-size:0.8rem; }
         .search-wrapper input:focus { border-color:var(--accent); }
         .search-icon { position:absolute; left:10px; top:50%; transform:translateY(-50%); font-size:0.75rem; opacity:0.5; pointer-events:none; }
-        .filter-bar {
-            display:flex; align-items:center; gap:6px; flex-wrap:wrap;
-            width:100%; margin-top:2px;
-        }
-        .filter-bar select, .filter-bar input[type="date"] {
+        #sortSelect, #filterDateStart, #filterDateEnd {
             padding:4px 8px; border-radius:6px; border:1px solid var(--border);
-            background:var(--bg); color:var(--text); font-size:0.75rem;
+            background:var(--bg); color:var(--text); font-size:0.75rem; white-space:nowrap;
         }
         .stats { display:flex; gap:5px; }
         .stat { font-size:0.7rem; padding:2px 6px; border-radius:10px; background:var(--tag-bg); }
@@ -181,18 +177,18 @@
                 <span class="stat">💾 <span id="statSize">0 B</span></span>
             </div>
             <span class="current-folder-badge" id="currentFolderBadge" style="display:none;"></span>
-            <div class="filter-bar">
-                <select id="sortSelect">
-                    <option value="name-asc">名称 ↑</option>
-                    <option value="name-desc">名称 ↓</option>
-                    <option value="date-desc">时间 ↓</option>
-                    <option value="date-asc">时间 ↑</option>
-                </select>
-                <input type="date" id="filterDateStart" title="开始日期">
-                <input type="date" id="filterDateEnd" title="结束日期">
-                <button class="btn" id="applyFilterBtn">筛选</button>
-                <button class="btn" id="clearFilterBtn">清除</button>
-            </div>
+            <select id="sortSelect">
+                <option value="date-desc" selected>时间 ↓</option>
+                <option value="date-asc">时间 ↑</option>
+                <option value="name-asc">名称 ↑</option>
+                <option value="name-desc">名称 ↓</option>
+                <option value="size-desc">大小 ↓</option>
+                <option value="size-asc">大小 ↑</option>
+            </select>
+            <input type="date" id="filterDateStart" title="开始日期">
+            <input type="date" id="filterDateEnd" title="结束日期">
+            <button class="btn" id="applyFilterBtn">筛选</button>
+            <button class="btn" id="clearFilterBtn">清除</button>
         </nav>
         
         <div class="scroll-container" id="scrollContainer">
@@ -264,7 +260,10 @@
             let resizeObserver = null;
             let ticking = false;
             let currentScale = 1;
-            let currentSort = 'name-asc';
+            let currentSort = 'date-desc';
+            
+            // 搜索防抖定时器
+            let searchDebounceTimer = null;
             
             // 内存管理：跟踪所有 Object URL 和观察者实例
             let objectUrlSet = new Set();
@@ -503,8 +502,8 @@
                 const scrollTop = scrollContainer.scrollTop;
                 const viewHeight = scrollContainer.clientHeight;
                 const totalItems = currentDisplayImages.length;
-                const startRow = Math.max(0, Math.floor(scrollTop / (rowHeight + gap)) - 1);
-                const endRow = Math.min(Math.ceil(totalItems / columnCount), Math.ceil((scrollTop + viewHeight) / (rowHeight + gap)) + 1);
+                const startRow = Math.max(0, Math.floor(scrollTop / (rowHeight + gap)) - 2);
+                const endRow = Math.min(Math.ceil(totalItems / columnCount), Math.ceil((scrollTop + viewHeight) / (rowHeight + gap)) + 2);
                 const startIndex = startRow * columnCount;
                 const endIndex = Math.min(totalItems, endRow * columnCount);
                 if (startIndex === renderedStartIndex && endIndex === renderedEndIndex) return;
@@ -614,7 +613,7 @@
                 const startVal = filterDateStart.value;
                 const endVal = filterDateEnd.value;
                 if (startVal || endVal) {
-                    const start = startVal ? new Date(startVal).getTime() : null;
+                    const start = startVal ? new Date(startVal + 'T00:00:00').getTime() : null;
                     const end = endVal ? new Date(endVal + 'T23:59:59.999').getTime() : null;
                     filtered = filtered.filter(img => {
                         const time = img.modified || 0;
@@ -633,6 +632,9 @@
                     } else if (sortKey === 'date') {
                         valA = a.modified || 0;
                         valB = b.modified || 0;
+                    } else if (sortKey === 'size') {
+                        valA = a.size || 0;
+                        valB = b.size || 0;
                     }
                     if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
                     if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
@@ -654,7 +656,9 @@
                     const rootEl = document.querySelector('.tree-item[data-path="__root__"]');
                     if (rootEl) rootEl.classList.add('active');
                 } else {
-                    const activeEl = document.querySelector(`.tree-item[data-path="${CSS.escape(activeFolder)}"]`);
+                    // CSS.escape 兼容性处理
+                    const escapedPath = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(activeFolder) : activeFolder.replace(/"/g, '\\"');
+                    const activeEl = document.querySelector(`.tree-item[data-path="${escapedPath}"]`);
                     if (activeEl) activeEl.classList.add('active');
                 }
                 updateLayoutParams();
@@ -684,6 +688,9 @@
                 lightbox.style.display='none'; 
                 lightboxImg.src=''; 
                 resetZoom();
+                // 清理状态，防止内存泄漏
+                currentLightboxList = [];
+                currentIndex = -1;
             }
 
             function navLightbox(dir){
@@ -711,6 +718,12 @@
 
             // 全屏切换
             function toggleFullscreen() {
+                // 检测全屏 API 支持
+                if (!document.fullscreenEnabled) {
+                    showToast('❌ 浏览器不支持全屏功能');
+                    return;
+                }
+                
                 if (!document.fullscreenElement) {
                     lightbox.requestFullscreen().catch(err => {
                         showToast('全屏失败：' + err.message);
@@ -734,6 +747,11 @@
                 } catch (err) {
                     showToast('❌ 复制失败：' + err.message);
                 }
+            }
+
+            // 检测复制功能支持，不支持则隐藏按钮
+            if (!navigator.clipboard || !window.ClipboardItem) {
+                lightboxCopy.style.display = 'none';
             }
 
             // 事件绑定
@@ -798,8 +816,12 @@
             });
 
             searchInput.addEventListener('input', () => {
-                scrollContainer.scrollTop = 0;
-                updateDisplay();
+                // 搜索防抖：300ms 延迟执行
+                clearTimeout(searchDebounceTimer);
+                searchDebounceTimer = setTimeout(() => {
+                    scrollContainer.scrollTop = 0;
+                    updateDisplay();
+                }, 300);
             });
 
             async function handleSelectFolder() {
