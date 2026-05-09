@@ -213,6 +213,13 @@
         </div>
     </div>
     <div class="toast" id="toast"></div>
+    
+    <!-- 加载状态指示器 -->
+    <div id="loadingOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:3000; align-items:center; justify-content:center; flex-direction:column; color:#fff;">
+        <div style="font-size:2rem; margin-bottom:16px;">⏳</div>
+        <div id="loadingText" style="font-size:1.1rem; margin-bottom:8px;">正在扫描文件夹...</div>
+        <div id="loadingProgress" style="font-size:0.9rem; opacity:0.8;">已发现 0 张图片</div>
+    </div>
 
     <script>
         (() => {
@@ -238,6 +245,11 @@
             const scrollContainer = document.getElementById('scrollContainer');
             const scrollPlaceholder = document.getElementById('scrollPlaceholder');
             const visibleContent = document.getElementById('visibleContent');
+            
+            // 加载状态指示器
+            const loadingOverlay = document.getElementById('loadingOverlay');
+            const loadingText = document.getElementById('loadingText');
+            const loadingProgress = document.getElementById('loadingProgress');
 
             const sortSelect = document.getElementById('sortSelect');
             const filterDateStart = document.getElementById('filterDateStart');
@@ -261,6 +273,13 @@
             let ticking = false;
             let currentScale = 1;
             let currentSort = 'date-desc';
+            
+            // 缩放平移状态
+            let panX = 0;
+            let panY = 0;
+            let isPanning = false;
+            let startX = 0;
+            let startY = 0;
             
             // 搜索防抖定时器
             let searchDebounceTimer = null;
@@ -306,6 +325,17 @@
                 }
                 
                 console.log('All resources cleaned up');
+            }
+            
+            // 加载状态控制函数
+            function showLoading(text = '正在扫描文件夹...', progress = '') {
+                loadingText.textContent = text;
+                loadingProgress.textContent = progress;
+                loadingOverlay.style.display = 'flex';
+            }
+            
+            function hideLoading() {
+                loadingOverlay.style.display = 'none';
             }
 
             function formatDate(ms) {
@@ -566,8 +596,25 @@
                             const src = img.dataset.src;
                             if (src && !img.src) {
                                 img.src = src;
-                                img.onload = () => img.classList.add('loaded');
-                                img.onerror = () => { img.style.background = '#f0e0e0'; };
+                                img.onload = () => {
+                                    img.classList.add('loaded');
+                                    // 移除错误提示（如果有）
+                                    const errorOverlay = img.parentElement.querySelector('.img-error');
+                                    if (errorOverlay) errorOverlay.remove();
+                                };
+                                img.onerror = () => {
+                                    img.style.display = 'none';
+                                    // 添加友好的错误提示
+                                    const errorOverlay = document.createElement('div');
+                                    errorOverlay.className = 'img-error';
+                                    errorOverlay.innerHTML = `
+                                        <div style="position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#f8f8f8; color:#999;">
+                                            <div style="font-size:2rem; margin-bottom:8px;">⚠️</div>
+                                            <div style="font-size:0.75rem;">加载失败</div>
+                                        </div>
+                                    `;
+                                    img.parentElement.appendChild(errorOverlay);
+                                };
                             }
                             lazyObserver.unobserve(img);
                         }
@@ -643,8 +690,17 @@
 
                 currentDisplayImages = filtered;
                 statImages.textContent = filtered.length;
-                statFolders.textContent = new Set(filtered.map(i=>normalizePath(i.folder||'根目录'))).size;
-                statSize.textContent = formatSize(filtered.reduce((s,i)=>s+(i.size||0),0));
+                
+                // 优化统计计算：避免重复创建 Set，使用更高效的计算方式
+                const folderSet = new Set();
+                let totalSize = 0;
+                for (let i = 0; i < filtered.length; i++) {
+                    const img = filtered[i];
+                    folderSet.add(normalizePath(img.folder || '根目录'));
+                    totalSize += img.size || 0;
+                }
+                statFolders.textContent = folderSet.size;
+                statSize.textContent = formatSize(totalSize);
                 if (activeFolder === null) {
                     currentFolderBadge.style.display = 'none';
                 } else {
@@ -703,18 +759,106 @@
 
             function resetZoom() {
                 currentScale = 1;
-                lightboxImgWrapper.style.transform = `scale(1)`;
+                panX = 0;
+                panY = 0;
+                updateTransform();
             }
 
             function zoomIn() {
                 currentScale = Math.min(currentScale + 0.25, 5);
-                lightboxImgWrapper.style.transform = `scale(${currentScale})`;
+                updateTransform();
             }
 
             function zoomOut() {
                 currentScale = Math.max(currentScale - 0.25, 0.25);
-                lightboxImgWrapper.style.transform = `scale(${currentScale})`;
+                // 缩小到一定程度时重置平移
+                if (currentScale <= 1) {
+                    panX = 0;
+                    panY = 0;
+                }
+                updateTransform();
             }
+            
+            // 更新变换（缩放+平移）
+            function updateTransform() {
+                lightboxImgWrapper.style.transform = `translate(${panX}px, ${panY}px) scale(${currentScale})`;
+            }
+            
+            // 开始平移
+            function startPan(e) {
+                if (currentScale <= 1) return; // 只有在放大时才允许平移
+                isPanning = true;
+                startX = e.clientX || e.touches[0].clientX;
+                startY = e.clientY || e.touches[0].clientY;
+                lightboxImgWrapper.style.cursor = 'grabbing';
+                e.preventDefault();
+            }
+            
+            // 平移中
+            function doPan(e) {
+                if (!isPanning) return;
+                const clientX = e.clientX || e.touches[0].clientX;
+                const clientY = e.clientY || e.touches[0].clientY;
+                const deltaX = clientX - startX;
+                const deltaY = clientY - startY;
+                panX += deltaX;
+                panY += deltaY;
+                startX = clientX;
+                startY = clientY;
+                updateTransform();
+                e.preventDefault();
+            }
+            
+            // 结束平移
+            function endPan() {
+                isPanning = false;
+                lightboxImgWrapper.style.cursor = currentScale > 1 ? 'grab' : 'default';
+            }
+            
+            // 移动端双指缩放手势
+            let initialDistance = 0;
+            let initialScale = 1;
+            
+            function getTouchDistance(touch1, touch2) {
+                const dx = touch1.clientX - touch2.clientX;
+                const dy = touch1.clientY - touch2.clientY;
+                return Math.sqrt(dx * dx + dy * dy);
+            }
+            
+            lightboxImgWrapper.addEventListener('touchstart', (e) => {
+                if (e.touches.length === 2) {
+                    // 双指缩放开始
+                    e.preventDefault();
+                    initialDistance = getTouchDistance(e.touches[0], e.touches[1]);
+                    initialScale = currentScale;
+                } else if (e.touches.length === 1 && currentScale <= 1) {
+                    // 单指滑动切换（仅在未放大时）
+                    startX = e.touches[0].clientX;
+                }
+            }, { passive: false });
+            
+            lightboxImgWrapper.addEventListener('touchmove', (e) => {
+                if (e.touches.length === 2) {
+                    // 双指缩放中
+                    e.preventDefault();
+                    const currentDistance = getTouchDistance(e.touches[0], e.touches[1]);
+                    const scale = initialScale * (currentDistance / initialDistance);
+                    currentScale = Math.max(0.25, Math.min(scale, 5));
+                    updateTransform();
+                } else if (e.touches.length === 1 && currentScale <= 1 && !isPanning) {
+                    // 单指滑动检测（用于切换图片）
+                    const deltaX = e.touches[0].clientX - startX;
+                    if (Math.abs(deltaX) > 50) {
+                        // 滑动距离超过50px，触发切换
+                        if (deltaX > 0) {
+                            navLightbox(-1); // 向右滑，上一张
+                        } else {
+                            navLightbox(1); // 向左滑，下一张
+                        }
+                        startX = e.touches[0].clientX;
+                    }
+                }
+            }, { passive: false });
 
             // 全屏切换
             function toggleFullscreen() {
@@ -771,7 +915,21 @@
                 if (e.deltaY < 0) zoomIn();
                 else zoomOut();
             }, { passive: false });
-
+            
+            // 添加平移事件监听（鼠标）
+            lightboxImgWrapper.addEventListener('mousedown', startPan);
+            document.addEventListener('mousemove', doPan);
+            document.addEventListener('mouseup', endPan);
+            
+            // 添加触摸事件监听（移动端）
+            lightboxImgWrapper.addEventListener('touchstart', startPan, { passive: false });
+            document.addEventListener('touchmove', doPan, { passive: false });
+            document.addEventListener('touchend', endPan);
+            
+            // 设置初始光标样式
+            lightboxImgWrapper.style.cursor = 'default';
+            lightboxImgWrapper.style.transition = 'transform 0.1s ease-out';
+            
             document.addEventListener('keydown', e=>{
                 if(lightbox.style.display==='flex'){
                     if(e.key==='Escape') {
@@ -828,10 +986,15 @@
                 try {
                     const dirHandle = await window.showDirectoryPicker();
                     
+                    // 显示加载状态
+                    showLoading('正在扫描文件夹...', '已发现 0 张图片');
+                    
                     // 先清理所有旧资源
                     cleanupObjectUrls();
                     
                     const images = [];
+                    let scannedCount = 0;
+                    
                     async function scanDirHandle(handle, pathPrefix = '') {
                         const rawPath = pathPrefix ? pathPrefix + '/' + handle.name : handle.name;
                         const currentPath = normalizePath(rawPath);
@@ -850,6 +1013,14 @@
                                         size: file.size,
                                         modified: file.lastModified
                                     });
+                                    scannedCount++;
+                                    
+                                    // 每扫描100个文件更新一次进度（避免频繁DOM操作）
+                                    if (scannedCount % 100 === 0) {
+                                        loadingProgress.textContent = `已发现 ${scannedCount} 张图片`;
+                                        // 让出主线程，避免界面冻结
+                                        await new Promise(resolve => setTimeout(resolve, 0));
+                                    }
                                 }
                             } else if (entry.kind === 'directory') {
                                 await scanDirHandle(entry, currentPath);
@@ -857,6 +1028,9 @@
                         }
                     }
                     await scanDirHandle(dirHandle);
+                    
+                    // 隐藏加载状态
+                    hideLoading();
                     
                     // 不再需要手动清理，cleanupObjectUrls 已处理
                     allImages = images;
@@ -868,6 +1042,8 @@
                     updateDisplay();
                     showToast(`✅ 已加载 ${allImages.length} 张图片`);
                 } catch (err) {
+                    // 确保出错时也隐藏加载状态
+                    hideLoading();
                     if (err.name !== 'AbortError') {
                         showToast('❌ 无法读取文件夹：' + err.message);
                     }
@@ -875,25 +1051,28 @@
             }
             selectFolderBtn.addEventListener('click', handleSelectFolder);
 
-            if (window.ResizeObserver) {
-                resizeObserver = new ResizeObserver(() => {
+            scrollContainer.addEventListener('scroll', onScroll, { passive: true });
+            
+            // 优先使用 ResizeObserver，resize 事件作为降级方案并添加防抖
+            let resizeDebounceTimer = null;
+            const handleResize = () => {
+                clearTimeout(resizeDebounceTimer);
+                resizeDebounceTimer = setTimeout(() => {
                     updateLayoutParams();
                     renderedStartIndex = -1;
                     renderedEndIndex = -1;
                     renderVisibleItems();
                     observeVisibleImages();
-                });
+                }, 150);
+            };
+            
+            if (window.ResizeObserver) {
+                resizeObserver = new ResizeObserver(handleResize);
                 resizeObserver.observe(scrollContainer);
+            } else {
+                // 降级方案：使用 resize 事件
+                window.addEventListener('resize', handleResize);
             }
-
-            scrollContainer.addEventListener('scroll', onScroll, { passive: true });
-            window.addEventListener('resize', () => {
-                updateLayoutParams();
-                renderedStartIndex = -1;
-                renderedEndIndex = -1;
-                renderVisibleItems();
-                observeVisibleImages();
-            });
 
             initLazyObserver();
             folderTree = null;
