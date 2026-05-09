@@ -102,6 +102,28 @@
             opacity:0; transition: opacity 0.3s;
         }
         .img-container img.loaded { opacity:1; }
+        
+        /* 图片加载动画 */
+        .img-loading-placeholder {
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+            background-size: 200% 100%;
+            animation: loading-shimmer 1.5s infinite;
+        }
+        
+        @keyframes loading-shimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+        
+        @media (prefers-color-scheme: dark) {
+            .img-loading-placeholder {
+                background: linear-gradient(90deg, #3a3a3c 25%, #2c2c2e 50%, #3a3a3c 75%);
+                background-size: 200% 100%;
+            }
+        }
+        
         .card-info { padding:6px 10px 10px; display:flex; flex-direction:column; gap:3px; }
         .file-name { font-weight:600; font-size:0.78rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .meta-tag { font-size:0.65rem; padding:2px 5px; border-radius:4px; display:inline-flex; align-items:center; gap:2px; }
@@ -267,6 +289,20 @@
             let columnCount = 4;
             let containerWidth = 0;
             let gap = 12;
+            
+            // 分批加载配置 - 基于文件大小的动态批次策略
+            const MIN_BATCH = 1;           // 最小批次（大图单张加载）
+            const MAX_BATCH = 20;          // 最大批次（小图批量）
+            const HALF_SIZE = 1 * 1024 * 1024; // 半衰期 1MB（批次减半的文件大小阈值）
+            const BATCH_INTERVAL = 100;    // 批次间隔时间(ms)
+            let loadingBatchTimer = null; // 分批加载定时器
+            
+            // 滚动暂停控制 - 智能暂停策略
+            const SCROLL_PAUSE_THRESHOLD = 500 * 1024; // 暂停阈值：500KB（超过此大小的图片在滚动时暂停加载）
+            let isScrolling = false;       // 是否正在滚动
+            let scrollPauseTimer = null;   // 滚动停止定时器
+            const SCROLL_STOP_DELAY = 300; // 滚动停止后延迟恢复时间(ms)
+            
             let renderedStartIndex = 0;
             let renderedEndIndex = 0;
             let resizeObserver = null;
@@ -309,6 +345,21 @@
             
             // 全局资源清理函数
             function cleanupAllResources() {
+                // 清理分批加载定时器
+                if (loadingBatchTimer) {
+                    clearTimeout(loadingBatchTimer);
+                    loadingBatchTimer = null;
+                }
+                
+                // 清理滚动相关定时器
+                if (scrollPauseTimer) {
+                    clearTimeout(scrollPauseTimer);
+                    scrollPauseTimer = null;
+                }
+                
+                // 重置滚动状态
+                isScrolling = false;
+                
                 // 清理所有 Object URL
                 cleanupObjectUrls();
                 
@@ -336,6 +387,13 @@
             
             function hideLoading() {
                 loadingOverlay.style.display = 'none';
+            }
+            
+            // 动态批次大小计算（指数衰减策略）
+            function getBatchSize(fileSize) {
+                // 指数衰减公式：batchSize = MAX_BATCH * e^(-fileSize / HALF_SIZE)
+                const batchSize = Math.max(MIN_BATCH, Math.round(MAX_BATCH * Math.exp(-fileSize / HALF_SIZE)));
+                return batchSize;
             }
 
             function formatDate(ms) {
@@ -627,20 +685,133 @@
 
             function observeVisibleImages() {
                 if (!lazyObserver) initLazyObserver();
-                const imgs = visibleContent.querySelectorAll('img[data-src]');
-                imgs.forEach(img => {
-                    // 只观察尚未加载的图片，避免重复观察
+                
+                // 清除之前的分批加载定时器
+                if (loadingBatchTimer) {
+                    clearTimeout(loadingBatchTimer);
+                }
+                
+                // 收集当前可见区域未加载的图片元素及其数据
+                const imgElements = visibleContent.querySelectorAll('img[data-src]');
+                const pendingImages = [];
+                
+                imgElements.forEach(img => {
+                    // 只处理尚未加载的图片
                     if (!img.src && !img.classList.contains('loaded')) {
-                        lazyObserver.observe(img);
+                        const src = img.dataset.src;
+                        // 从 currentDisplayImages 中找到对应的图片数据
+                        const imgData = currentDisplayImages.find(item => item.url === src);
+                        if (imgData) {
+                            pendingImages.push({
+                                element: img,
+                                data: imgData
+                            });
+                        }
                     }
                 });
+                
+                // 按文件大小升序排序（小文件优先加载）
+                pendingImages.sort((a, b) => (a.data.size || 0) - (b.data.size || 0));
+                
+                // 分批调度加载 - 使用动态批次大小 + 智能暂停策略
+                let currentIndex = 0;
+                let batchDelay = 0;
+                
+                while (currentIndex < pendingImages.length) {
+                    const currentFileSize = pendingImages[currentIndex].data.size || 0;
+                    
+                    // 🎯 智能暂停：滚动中且是大图时跳过该批次及后续所有批次
+                    if (isScrolling && currentFileSize >= SCROLL_PAUSE_THRESHOLD) {
+                        console.log(`Paused loading large image: ${(currentFileSize / 1024).toFixed(0)}KB during scroll`);
+                        break; // 停止调度后续批次（因为已按大小排序，后续都是更大的图）
+                    }
+                    
+                    const dynamicBatchSize = getBatchSize(currentFileSize);
+                    
+                    // 提取当前批次
+                    const batch = pendingImages.slice(currentIndex, currentIndex + dynamicBatchSize);
+                    
+                    // 调度当前批次加载
+                    loadingBatchTimer = setTimeout(() => {
+                        loadBatchWithPlaceholder(batch);
+                    }, batchDelay);
+                    
+                    // 更新索引和延迟时间
+                    currentIndex += dynamicBatchSize;
+                    batchDelay += BATCH_INTERVAL; // 每批间隔固定时间
+                }
+            }
+            
+            // 分批加载图片并显示占位符
+            function loadBatchWithPlaceholder(batch) {
+                batch.forEach(({ element, data }) => {
+                    loadImageWithPlaceholder(element, data);
+                });
+            }
+            
+            // 带占位符的图片加载
+            function loadImageWithPlaceholder(imgElement, imgData) {
+                // 如果已经加载或正在加载，跳过
+                if (imgElement.src || imgElement.classList.contains('loaded')) return;
+                
+                // 添加加载占位符动画
+                const placeholder = document.createElement('div');
+                placeholder.className = 'img-loading-placeholder';
+                imgElement.parentElement.appendChild(placeholder);
+                
+                // 使用 IntersectionObserver 观察
+                lazyObserver.observe(imgElement);
+                
+                // 触发实际加载
+                const tempImg = new Image();
+                tempImg.onload = () => {
+                    imgElement.src = imgData.url;
+                    imgElement.classList.add('loaded');
+                    // 移除占位符
+                    if (placeholder.parentElement) {
+                        placeholder.remove();
+                    }
+                };
+                tempImg.onerror = () => {
+                    // 移除占位符，显示错误状态
+                    if (placeholder.parentElement) {
+                        placeholder.remove();
+                    }
+                    imgElement.style.display = 'none';
+                    const errorOverlay = document.createElement('div');
+                    errorOverlay.className = 'img-error';
+                    errorOverlay.innerHTML = `
+                        <div style="position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#f8f8f8; color:#999;">
+                            <div style="font-size:2rem; margin-bottom:8px;">⚠️</div>
+                            <div style="font-size:0.75rem;">加载失败</div>
+                        </div>
+                    `;
+                    imgElement.parentElement.appendChild(errorOverlay);
+                };
+                tempImg.src = imgData.url;
             }
 
             function onScroll() {
+                // 标记为滚动状态
+                isScrolling = true;
+                
+                // 清除之前的恢复定时器
+                if (scrollPauseTimer) {
+                    clearTimeout(scrollPauseTimer);
+                }
+                
+                // 设置滚动停止后的恢复定时器
+                scrollPauseTimer = setTimeout(() => {
+                    isScrolling = false;
+                    // 滚动停止后恢复加载
+                    observeVisibleImages();
+                }, SCROLL_STOP_DELAY);
+                
+                // 原有的虚拟滚动逻辑
                 if (!ticking) {
                     requestAnimationFrame(() => {
                         renderVisibleItems();
-                        observeVisibleImages();
+                        // 注意：这里不调用 observeVisibleImages，由滚动停止后触发
                         ticking = false;
                     });
                     ticking = true;
