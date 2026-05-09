@@ -265,6 +265,10 @@
             let ticking = false;
             let currentScale = 1;
             let currentSort = 'name-asc';
+            
+            // 内存管理：跟踪所有 Object URL 和观察者实例
+            let objectUrlSet = new Set();
+            let lazyObserverInstance = null;
 
             function formatSize(bytes) {
                 if (!bytes) return '0 B';
@@ -272,6 +276,39 @@
                 while(bytes>=1024 && i<3){bytes/=1024;i++;}
                 return bytes.toFixed(i?1:0)+' '+u[i];
             }
+            
+            // 统一的 Object URL 清理函数
+            function cleanupObjectUrls() {
+                objectUrlSet.forEach(url => {
+                    try {
+                        URL.revokeObjectURL(url);
+                    } catch (e) {
+                        console.warn('Failed to revoke URL:', e);
+                    }
+                });
+                objectUrlSet.clear();
+            }
+            
+            // 全局资源清理函数
+            function cleanupAllResources() {
+                // 清理所有 Object URL
+                cleanupObjectUrls();
+                
+                // 断开 IntersectionObserver
+                if (lazyObserver) {
+                    lazyObserver.disconnect();
+                    lazyObserver = null;
+                }
+                
+                // 断开 ResizeObserver
+                if (resizeObserver) {
+                    resizeObserver.disconnect();
+                    resizeObserver = null;
+                }
+                
+                console.log('All resources cleaned up');
+            }
+
             function formatDate(ms) {
                 if(!ms) return '';
                 const d=new Date(ms);
@@ -519,7 +556,10 @@
 
             let lazyObserver = null;
             function initLazyObserver() {
-                if (lazyObserver) lazyObserver.disconnect();
+                // 先断开旧实例，防止实例累积
+                if (lazyObserver) {
+                    lazyObserver.disconnect();
+                }
                 lazyObserver = new IntersectionObserver((entries) => {
                     entries.forEach(entry => {
                         if (entry.isIntersecting) {
@@ -534,12 +574,20 @@
                         }
                     });
                 }, { root: scrollContainer, rootMargin: '200px', threshold: 0.01 });
+                
+                // 保存实例引用以便后续清理
+                lazyObserverInstance = lazyObserver;
             }
 
             function observeVisibleImages() {
                 if (!lazyObserver) initLazyObserver();
                 const imgs = visibleContent.querySelectorAll('img[data-src]');
-                imgs.forEach(img => lazyObserver.observe(img));
+                imgs.forEach(img => {
+                    // 只观察尚未加载的图片，避免重复观察
+                    if (!img.src && !img.classList.contains('loaded')) {
+                        lazyObserver.observe(img);
+                    }
+                });
             }
 
             function onScroll() {
@@ -757,6 +805,10 @@
             async function handleSelectFolder() {
                 try {
                     const dirHandle = await window.showDirectoryPicker();
+                    
+                    // 先清理所有旧资源
+                    cleanupObjectUrls();
+                    
                     const images = [];
                     async function scanDirHandle(handle, pathPrefix = '') {
                         const rawPath = pathPrefix ? pathPrefix + '/' + handle.name : handle.name;
@@ -766,8 +818,11 @@
                                 const ext = entry.name.split('.').pop().toLowerCase();
                                 if (imageExtensions.has(ext)) {
                                     const file = await entry.getFile();
+                                    const url = URL.createObjectURL(file);
+                                    // 将创建的 URL 加入跟踪集合
+                                    objectUrlSet.add(url);
                                     images.push({
-                                        url: URL.createObjectURL(file),
+                                        url: url,
                                         name: entry.name,
                                         folder: currentPath,
                                         size: file.size,
@@ -780,7 +835,8 @@
                         }
                     }
                     await scanDirHandle(dirHandle);
-                    allImages.forEach(i=> URL.revokeObjectURL(i.url));
+                    
+                    // 不再需要手动清理，cleanupObjectUrls 已处理
                     allImages = images;
                     folderTree = buildFolderTree(allImages);
                     activeFolder = null;
@@ -821,6 +877,11 @@
             folderTree = null;
             renderTree();
             updateDisplay();
+            
+            // 页面卸载时清理所有资源，防止内存泄漏
+            window.addEventListener('beforeunload', () => {
+                cleanupAllResources();
+            });
         })();
     </script>
 </body>
