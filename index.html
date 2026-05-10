@@ -622,6 +622,9 @@
                 const imageEl = document.createElement('img');
                 imageEl.dataset.src = img.url;
                 imageEl.alt = img.name;
+                // 🛡️ 添加异步解码和原生懒加载属性，优化性能
+                imageEl.setAttribute('decoding', 'async');
+                imageEl.setAttribute('loading', 'lazy');
                 imageEl.style.width = '100%';
                 imageEl.style.height = '100%';
                 imgContainer.appendChild(imageEl);
@@ -647,34 +650,19 @@
                 if (lazyObserver) {
                     lazyObserver.disconnect();
                 }
+                
+                // 🛡️ 修改：IntersectionObserver 仅用于可见性检测，不直接触发加载
+                // 所有加载统一由 loadImageWithPlaceholder 控制，避免重复加载
                 lazyObserver = new IntersectionObserver((entries) => {
                     entries.forEach(entry => {
                         if (entry.isIntersecting) {
                             const img = entry.target;
-                            const src = img.dataset.src;
-                            if (src && !img.src) {
-                                img.src = src;
-                                img.onload = () => {
-                                    img.classList.add('loaded');
-                                    // 移除错误提示（如果有）
-                                    const errorOverlay = img.parentElement.querySelector('.img-error');
-                                    if (errorOverlay) errorOverlay.remove();
-                                };
-                                img.onerror = () => {
-                                    img.style.display = 'none';
-                                    // 添加友好的错误提示
-                                    const errorOverlay = document.createElement('div');
-                                    errorOverlay.className = 'img-error';
-                                    errorOverlay.innerHTML = `
-                                        <div style="position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#f8f8f8; color:#999;">
-                                            <div style="font-size:2rem; margin-bottom:8px;">⚠️</div>
-                                            <div style="font-size:0.75rem;">加载失败</div>
-                                        </div>
-                                    `;
-                                    img.parentElement.appendChild(errorOverlay);
-                                };
-                            }
-                            lazyObserver.unobserve(img);
+                            // 仅标记为可见，不直接设置 src
+                            // 实际加载由 observeVisibleImages 中的分批调度控制
+                            img.dataset.visible = 'true';
+                        } else {
+                            const img = entry.target;
+                            delete img.dataset.visible;
                         }
                     });
                 }, { root: scrollContainer, rootMargin: '200px', threshold: 0.01 });
@@ -691,13 +679,20 @@
                     clearTimeout(loadingBatchTimer);
                 }
                 
+                // 🛡️ 辅助函数：检查图片是否在视口内（±200px 缓冲）
+                function isInViewport(imgElement) {
+                    const rect = imgElement.getBoundingClientRect();
+                    const viewHeight = window.innerHeight || document.documentElement.clientHeight;
+                    return rect.top >= -200 && rect.bottom <= viewHeight + 200;
+                }
+                
                 // 收集当前可见区域未加载的图片元素及其数据
                 const imgElements = visibleContent.querySelectorAll('img[data-src]');
                 const pendingImages = [];
                 
                 imgElements.forEach(img => {
-                    // 只处理尚未加载的图片
-                    if (!img.src && !img.classList.contains('loaded')) {
+                    // 只处理尚未加载、未调度且在视口内的图片
+                    if (!img.src && !img.classList.contains('loaded') && !img.dataset.scheduled && isInViewport(img)) {
                         const src = img.dataset.src;
                         // 从 currentDisplayImages 中找到对应的图片数据
                         const imgData = currentDisplayImages.find(item => item.url === src);
@@ -731,6 +726,11 @@
                     // 提取当前批次
                     const batch = pendingImages.slice(currentIndex, currentIndex + dynamicBatchSize);
                     
+                    // 🛡️ 标记已调度，防止重复加载
+                    batch.forEach(({ element }) => {
+                        element.dataset.scheduled = 'true';
+                    });
+                    
                     // 调度当前批次加载
                     loadingBatchTimer = setTimeout(() => {
                         loadBatchWithPlaceholder(batch);
@@ -744,7 +744,26 @@
             
             // 分批加载图片并显示占位符
             function loadBatchWithPlaceholder(batch) {
-                batch.forEach(({ element, data }) => {
+                // 🛡️ 执行前检查：如果处于滚动暂停状态，跳过该批次
+                if (isScrolling) {
+                    console.log('Batch loading skipped due to scrolling');
+                    return;
+                }
+                
+                // 🛡️ 执行前二次验证：过滤掉已滚出视口的图片
+                const validBatch = batch.filter(({ element }) => {
+                    const rect = element.getBoundingClientRect();
+                    const viewHeight = window.innerHeight || document.documentElement.clientHeight;
+                    return rect.top >= -200 && rect.bottom <= viewHeight + 200;
+                });
+                
+                if (validBatch.length === 0) {
+                    console.log('Batch skipped: all images out of viewport');
+                    return;
+                }
+                
+                // 只加载仍在视口内的图片
+                validBatch.forEach(({ element, data }) => {
                     loadImageWithPlaceholder(element, data);
                 });
             }
@@ -759,20 +778,24 @@
                 placeholder.className = 'img-loading-placeholder';
                 imgElement.parentElement.appendChild(placeholder);
                 
-                // 使用 IntersectionObserver 观察
-                lazyObserver.observe(imgElement);
+                // 🛡️ 移除：不再需要 lazyObserver.observe，避免与统一加载通路冲突
+                // IntersectionObserver 仅用于可见性检测，不触发加载
                 
                 // 触发实际加载
                 const tempImg = new Image();
                 tempImg.onload = () => {
                     imgElement.src = imgData.url;
                     imgElement.classList.add('loaded');
+                    // 🛡️ 清理 scheduled 标记，允许未来重新加载
+                    delete imgElement.dataset.scheduled;
                     // 移除占位符
                     if (placeholder.parentElement) {
                         placeholder.remove();
                     }
                 };
                 tempImg.onerror = () => {
+                    // 🛡️ 清理 scheduled 标记
+                    delete imgElement.dataset.scheduled;
                     // 移除占位符，显示错误状态
                     if (placeholder.parentElement) {
                         placeholder.remove();
@@ -972,8 +995,18 @@
                 const clientY = e.clientY || e.touches[0].clientY;
                 const deltaX = clientX - startX;
                 const deltaY = clientY - startY;
+                
                 panX += deltaX;
                 panY += deltaY;
+                
+                // 🛡️ 边界限制：防止图片移出视野
+                const wrapperRect = lightboxImgWrapper.parentElement.getBoundingClientRect();
+                const imgRect = lightboxImg.getBoundingClientRect();
+                const maxPanX = Math.max(0, (imgRect.width * currentScale - wrapperRect.width) / 2);
+                const maxPanY = Math.max(0, (imgRect.height * currentScale - wrapperRect.height) / 2);
+                panX = Math.max(-maxPanX, Math.min(maxPanX, panX));
+                panY = Math.max(-maxPanY, Math.min(maxPanY, panY));
+                
                 startX = clientX;
                 startY = clientY;
                 updateTransform();
@@ -996,15 +1029,21 @@
                 return Math.sqrt(dx * dx + dy * dy);
             }
             
+            // 统一的触摸事件处理（合并平移、缩放、滑动切换）
             lightboxImgWrapper.addEventListener('touchstart', (e) => {
                 if (e.touches.length === 2) {
                     // 双指缩放开始
                     e.preventDefault();
                     initialDistance = getTouchDistance(e.touches[0], e.touches[1]);
                     initialScale = currentScale;
-                } else if (e.touches.length === 1 && currentScale <= 1) {
-                    // 单指滑动切换（仅在未放大时）
-                    startX = e.touches[0].clientX;
+                } else if (e.touches.length === 1) {
+                    if (currentScale > 1) {
+                        // 放大状态：启动平移
+                        startPan(e);
+                    } else {
+                        // 未放大：记录起始位置用于滑动切换
+                        startX = e.touches[0].clientX;
+                    }
                 }
             }, { passive: false });
             
@@ -1013,9 +1052,14 @@
                     // 双指缩放中
                     e.preventDefault();
                     const currentDistance = getTouchDistance(e.touches[0], e.touches[1]);
+                    // 🛡️ 防止除零错误：初始距离过小时忽略
+                    if (initialDistance < 10) return;
                     const scale = initialScale * (currentDistance / initialDistance);
                     currentScale = Math.max(0.25, Math.min(scale, 5));
                     updateTransform();
+                } else if (e.touches.length === 1 && currentScale > 1) {
+                    // 放大状态：执行平移
+                    doPan(e);
                 } else if (e.touches.length === 1 && currentScale <= 1 && !isPanning) {
                     // 单指滑动检测（用于切换图片）
                     const deltaX = e.touches[0].clientX - startX;
@@ -1030,6 +1074,13 @@
                     }
                 }
             }, { passive: false });
+            
+            lightboxImgWrapper.addEventListener('touchend', (e) => {
+                if (currentScale > 1) {
+                    // 放大状态：结束平移
+                    endPan();
+                }
+            });
 
             // 全屏切换
             function toggleFullscreen() {
@@ -1091,11 +1142,6 @@
             lightboxImgWrapper.addEventListener('mousedown', startPan);
             document.addEventListener('mousemove', doPan);
             document.addEventListener('mouseup', endPan);
-            
-            // 添加触摸事件监听（移动端）
-            lightboxImgWrapper.addEventListener('touchstart', startPan, { passive: false });
-            document.addEventListener('touchmove', doPan, { passive: false });
-            document.addEventListener('touchend', endPan);
             
             // 设置初始光标样式
             lightboxImgWrapper.style.cursor = 'default';
@@ -1250,8 +1296,16 @@
             renderTree();
             updateDisplay();
             
+            // 🛡️ 保存清理函数引用，用于页面卸载时移除 resize 监听器
+            const cleanupResizeListener = () => {
+                if (!window.ResizeObserver) {
+                    window.removeEventListener('resize', handleResize);
+                }
+            };
+            
             // 页面卸载时清理所有资源，防止内存泄漏
             window.addEventListener('beforeunload', () => {
+                cleanupResizeListener();
                 cleanupAllResources();
             });
         })();
