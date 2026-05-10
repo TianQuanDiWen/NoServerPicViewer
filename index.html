@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>📷 本地图片浏览器（虚拟滚动+缩放+排序筛选）</title>
+    <title>本地图片浏览器</title>
     <style>
         :root {
             --bg: #f5f5f7;
@@ -290,18 +290,9 @@
             let containerWidth = 0;
             let gap = 12;
             
-            // 分批加载配置 - 基于文件大小的动态批次策略
-            const MIN_BATCH = 1;           // 最小批次（大图单张加载）
-            const MAX_BATCH = 20;          // 最大批次（小图批量）
-            const HALF_SIZE = 1 * 1024 * 1024; // 半衰期 1MB（批次减半的文件大小阈值）
-            const BATCH_INTERVAL = 100;    // 批次间隔时间(ms)
-            let loadingBatchTimer = null; // 分批加载定时器
-            
-            // 滚动暂停控制 - 智能暂停策略
-            const SCROLL_PAUSE_THRESHOLD = 500 * 1024; // 暂停阈值：500KB（超过此大小的图片在滚动时暂停加载）
-            let isScrolling = false;       // 是否正在滚动
-            let scrollPauseTimer = null;   // 滚动停止定时器
-            const SCROLL_STOP_DELAY = 300; // 滚动停止后延迟恢复时间(ms)
+            let loadingBatchTimer = null;
+            let isScrolling = false;
+            let scrollPauseTimer = null;
             
             let renderedStartIndex = 0;
             let renderedEndIndex = 0;
@@ -310,19 +301,86 @@
             let currentScale = 1;
             let currentSort = 'date-desc';
             
-            // 缩放平移状态
             let panX = 0;
             let panY = 0;
             let isPanning = false;
             let startX = 0;
             let startY = 0;
             
-            // 搜索防抖定时器
             let searchDebounceTimer = null;
-            
-            // 内存管理：跟踪所有 Object URL 和观察者实例
             let objectUrlSet = new Set();
-            let lazyObserverInstance = null;
+
+            const CONFIG = {
+                VIEWPORT_BUFFER: 200,
+                ROW_OVERSCAN: 3,
+                SCROLL_PAUSE_THRESHOLD: 500 * 1024,
+                SCROLL_STOP_DELAY: 50,
+                SWIPE_THRESHOLD: 50,
+                SEARCH_DEBOUNCE: 300,
+                MIN_BATCH: 1,
+                MAX_BATCH: 20,
+                HALF_SIZE: 1 * 1024 * 1024,
+                BATCH_INTERVAL: 100,
+                THUMBNAIL_SIZE_THRESHOLD: 500 * 1024,
+                THUMBNAIL_MAX_WIDTH: 400,
+                THUMBNAIL_MAX_HEIGHT: 300,
+                THUMBNAIL_QUALITY: 0.8,
+                LRU_CACHE_MAX_SIZE: 200,
+            };
+
+            class ThumbnailLRUCache {
+                constructor(maxSize) {
+                    this.maxSize = maxSize;
+                    this.cache = new Map();
+                }
+                
+                get(imageUrl) {
+                    if (!this.cache.has(imageUrl)) return null;
+                    const item = this.cache.get(imageUrl);
+                    item.lastAccess = Date.now();
+                    return item.blobUrl;
+                }
+                
+                set(imageUrl, blobUrl) {
+                    if (this.cache.has(imageUrl)) {
+                        this.cache.delete(imageUrl);
+                    }
+                    this.cache.set(imageUrl, { blobUrl, lastAccess: Date.now() });
+                    if (this.cache.size > this.maxSize) this.evict();
+                }
+                
+                has(imageUrl) { return this.cache.has(imageUrl); }
+                
+                delete(imageUrl) {
+                    if (this.cache.has(imageUrl)) {
+                        const item = this.cache.get(imageUrl);
+                        try { URL.revokeObjectURL(item.blobUrl); } catch (e) {}
+                        this.cache.delete(imageUrl);
+                    }
+                }
+                
+                clear() {
+                    for (const [, item] of this.cache) {
+                        try { URL.revokeObjectURL(item.blobUrl); } catch (e) {}
+                    }
+                    this.cache.clear();
+                }
+                
+                evict() {
+                    let oldestKey = null, oldestTime = Infinity;
+                    for (const [key, item] of this.cache) {
+                        if (item.lastAccess < oldestTime) {
+                            oldestTime = item.lastAccess;
+                            oldestKey = key;
+                        }
+                    }
+                    if (oldestKey) this.delete(oldestKey);
+                }
+                
+                get size() { return this.cache.size; }
+            }
+
+            const thumbnailCache = new ThumbnailLRUCache(CONFIG.LRU_CACHE_MAX_SIZE);
 
             function formatSize(bytes) {
                 if (!bytes) return '0 B';
@@ -341,6 +399,75 @@
                     }
                 });
                 objectUrlSet.clear();
+            }
+
+            let thumbnailQueue = [];
+            let isGeneratingThumbnail = false;
+
+            async function generateThumbnail(imageUrl, maxWidth, maxHeight) {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = async () => {
+                        try {
+                            const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
+                            const width = Math.floor(img.width * scale);
+                            const height = Math.floor(img.height * scale);
+                            
+                            const bitmap = await createImageBitmap(img, 0, 0, img.width, img.height, {
+                                resizeWidth: width,
+                                resizeHeight: height,
+                                resizeQuality: 'medium'
+                            });
+                            
+                            const canvas = document.createElement('canvas');
+                            canvas.width = width;
+                            canvas.height = height;
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(bitmap, 0, 0);
+                            bitmap.close();
+                            
+                            canvas.toBlob((blob) => {
+                                if (blob) {
+                                    resolve(URL.createObjectURL(blob));
+                                } else {
+                                    reject(new Error('Failed to create blob'));
+                                }
+                            }, 'image/jpeg', CONFIG.THUMBNAIL_QUALITY);
+                        } catch (err) {
+                            reject(err);
+                        }
+                    };
+                    img.onerror = () => reject(new Error('Failed to load image'));
+                    img.src = imageUrl;
+                });
+            }
+
+            async function processThumbnailQueue() {
+                if (isGeneratingThumbnail || thumbnailQueue.length === 0 || isScrolling) return;
+                
+                isGeneratingThumbnail = true;
+                const task = thumbnailQueue.shift();
+                
+                try {
+                    const blobUrl = await generateThumbnail(task.imageUrl, CONFIG.THUMBNAIL_MAX_WIDTH, CONFIG.THUMBNAIL_MAX_HEIGHT);
+                    thumbnailCache.set(task.imageUrl, blobUrl);
+                    task.resolve(blobUrl);
+                } catch (err) {
+                    console.error('Thumbnail generation failed:', err);
+                    task.reject(err);
+                } finally {
+                    isGeneratingThumbnail = false;
+                    if (!isScrolling && thumbnailQueue.length > 0) {
+                        setTimeout(processThumbnailQueue, 50);
+                    }
+                }
+            }
+
+            function enqueueThumbnailGeneration(imageUrl) {
+                return new Promise((resolve, reject) => {
+                    thumbnailQueue.push({ imageUrl, resolve, reject });
+                    processThumbnailQueue();
+                });
             }
             
             // 全局资源清理函数
@@ -363,11 +490,10 @@
                 // 清理所有 Object URL
                 cleanupObjectUrls();
                 
-                // 断开 IntersectionObserver
-                if (lazyObserver) {
-                    lazyObserver.disconnect();
-                    lazyObserver = null;
-                }
+                // 清理缩略图缓存和队列
+                thumbnailCache.clear();
+                thumbnailQueue = [];
+                isGeneratingThumbnail = false;
                 
                 // 断开 ResizeObserver
                 if (resizeObserver) {
@@ -391,9 +517,7 @@
             
             // 动态批次大小计算（指数衰减策略）
             function getBatchSize(fileSize) {
-                // 指数衰减公式：batchSize = MAX_BATCH * e^(-fileSize / HALF_SIZE)
-                const batchSize = Math.max(MIN_BATCH, Math.round(MAX_BATCH * Math.exp(-fileSize / HALF_SIZE)));
-                return batchSize;
+                return Math.max(CONFIG.MIN_BATCH, Math.round(CONFIG.MAX_BATCH * Math.exp(-fileSize / CONFIG.HALF_SIZE)));
             }
 
             function formatDate(ms) {
@@ -402,6 +526,21 @@
                 return d.getFullYear()+'-'+(d.getMonth()+1).toString().padStart(2,'0')+'-'+d.getDate().toString().padStart(2,'0');
             }
             function escapeHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+            
+            function showErrorPlaceholder(imgElement, placeholder) {
+                if (placeholder) {
+                    placeholder.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;font-size:0.8rem;">⚠️ 加载失败</div>';
+                    placeholder.classList.add('error');
+                }
+                imgElement.style.display = 'none';
+            }
+            
+            function isInViewport(imgElement) {
+                const rect = imgElement.getBoundingClientRect();
+                const viewHeight = window.innerHeight || document.documentElement.clientHeight;
+                return rect.top >= -CONFIG.VIEWPORT_BUFFER && rect.bottom <= viewHeight + CONFIG.VIEWPORT_BUFFER;
+            }
+
             function showToast(msg){
                 toast.textContent=msg; toast.classList.add('show');
                 clearTimeout(window._toastTimer);
@@ -583,51 +722,86 @@
 
             function renderVisibleItems() {
                 if (!scrollContainer || currentDisplayImages.length === 0) {
-                    visibleContent.innerHTML = '';
+                    Array.from(visibleContent.children).forEach(card => card.remove());
                     scrollPlaceholder.style.height = '0px';
                     return;
                 }
+                
                 const scrollTop = scrollContainer.scrollTop;
                 const viewHeight = scrollContainer.clientHeight;
                 const totalItems = currentDisplayImages.length;
-                const startRow = Math.max(0, Math.floor(scrollTop / (rowHeight + gap)) - 2);
-                const endRow = Math.min(Math.ceil(totalItems / columnCount), Math.ceil((scrollTop + viewHeight) / (rowHeight + gap)) + 2);
+                const startRow = Math.max(0, Math.floor(scrollTop / (rowHeight + gap)) - CONFIG.ROW_OVERSCAN);
+                const endRow = Math.min(Math.ceil(totalItems / columnCount), Math.ceil((scrollTop + viewHeight) / (rowHeight + gap)) + CONFIG.ROW_OVERSCAN);
                 const startIndex = startRow * columnCount;
                 const endIndex = Math.min(totalItems, endRow * columnCount);
+                
                 if (startIndex === renderedStartIndex && endIndex === renderedEndIndex) return;
                 renderedStartIndex = startIndex;
                 renderedEndIndex = endIndex;
-                visibleContent.innerHTML = '';
+                
+                const existingCards = Array.from(visibleContent.children);
+                const existingMap = new Map();
+                existingCards.forEach(card => existingMap.set(card.dataset.imageId, card));
+                
+                const newVisibleIds = new Set();
+                const colWidth = (containerWidth - gap * (columnCount - 1)) / columnCount;
+                
                 for (let i = startIndex; i < endIndex; i++) {
                     const img = currentDisplayImages[i];
+                    const imageId = img.url;
+                    newVisibleIds.add(imageId);
+                    
+                    let card = existingMap.get(imageId);
                     const row = Math.floor(i / columnCount);
                     const col = i % columnCount;
-                    const colWidth = (containerWidth - gap * (columnCount - 1)) / columnCount;
                     const left = col * (colWidth + gap);
                     const top = row * (rowHeight + gap);
-                    const card = createCardElement(img, i);
-                    card.style.width = colWidth + 'px';
-                    card.style.left = left + 'px';
-                    card.style.top = top + 'px';
-                    visibleContent.appendChild(card);
+                    
+                    if (!card) {
+                        card = createCardElement(img, i);
+                        card.style.width = colWidth + 'px';
+                        card.style.left = left + 'px';
+                        card.style.top = top + 'px';
+                        visibleContent.appendChild(card);
+                    } else {
+                        card.style.display = '';
+                        card.style.left = left + 'px';
+                        card.style.top = top + 'px';
+                        card.dataset.index = i;
+                    }
                 }
+                
+                existingCards.forEach(card => {
+                    if (!newVisibleIds.has(card.dataset.imageId)) {
+                        card.style.display = 'none';
+                    }
+                });
+                
                 scrollPlaceholder.style.height = getTotalHeight() + 'px';
             }
 
             function createCardElement(img, globalIndex) {
                 const card = document.createElement('div');
                 card.className = 'image-card';
+                card.dataset.imageId = img.url;
+                card.dataset.index = globalIndex;
+                
                 const imgContainer = document.createElement('div');
                 imgContainer.className = 'img-container';
+                
                 const imageEl = document.createElement('img');
                 imageEl.dataset.src = img.url;
                 imageEl.alt = img.name;
-                // 🛡️ 添加异步解码和原生懒加载属性，优化性能
                 imageEl.setAttribute('decoding', 'async');
                 imageEl.setAttribute('loading', 'lazy');
                 imageEl.style.width = '100%';
                 imageEl.style.height = '100%';
+                
+                const placeholder = document.createElement('div');
+                placeholder.className = 'img-loading-placeholder';
+                imgContainer.appendChild(placeholder);
                 imgContainer.appendChild(imageEl);
+                
                 const info = document.createElement('div');
                 info.className = 'card-info';
                 const folderShort = (normalizePath(img.folder || '') || '根目录').split('/').pop() || '根目录';
@@ -679,13 +853,6 @@
                     clearTimeout(loadingBatchTimer);
                 }
                 
-                // 🛡️ 辅助函数：检查图片是否在视口内（±200px 缓冲）
-                function isInViewport(imgElement) {
-                    const rect = imgElement.getBoundingClientRect();
-                    const viewHeight = window.innerHeight || document.documentElement.clientHeight;
-                    return rect.top >= -200 && rect.bottom <= viewHeight + 200;
-                }
-                
                 // 收集当前可见区域未加载的图片元素及其数据
                 const imgElements = visibleContent.querySelectorAll('img[data-src]');
                 const pendingImages = [];
@@ -716,11 +883,8 @@
                     const currentFileSize = pendingImages[currentIndex].data.size || 0;
                     
                     // 🎯 智能暂停：滚动中且是大图时跳过该批次及后续所有批次
-                    if (isScrolling && currentFileSize >= SCROLL_PAUSE_THRESHOLD) {
-                        console.log(`Paused loading large image: ${(currentFileSize / 1024).toFixed(0)}KB during scroll`);
-                        break; // 停止调度后续批次（因为已按大小排序，后续都是更大的图）
-                    }
-                    
+                    if (isScrolling && currentFileSize >= CONFIG.SCROLL_PAUSE_THRESHOLD) break;
+
                     const dynamicBatchSize = getBatchSize(currentFileSize);
                     
                     // 提取当前批次
@@ -738,80 +902,49 @@
                     
                     // 更新索引和延迟时间
                     currentIndex += dynamicBatchSize;
-                    batchDelay += BATCH_INTERVAL; // 每批间隔固定时间
+                    batchDelay += CONFIG.BATCH_INTERVAL;
+
                 }
             }
             
             // 分批加载图片并显示占位符
             function loadBatchWithPlaceholder(batch) {
-                // 🛡️ 执行前检查：如果处于滚动暂停状态，跳过该批次
-                if (isScrolling) {
-                    console.log('Batch loading skipped due to scrolling');
-                    return;
-                }
+                if (isScrolling) return;
                 
-                // 🛡️ 执行前二次验证：过滤掉已滚出视口的图片
-                const validBatch = batch.filter(({ element }) => {
-                    const rect = element.getBoundingClientRect();
-                    const viewHeight = window.innerHeight || document.documentElement.clientHeight;
-                    return rect.top >= -200 && rect.bottom <= viewHeight + 200;
-                });
+                const validBatch = batch.filter(({ element }) => isInViewport(element));
                 
-                if (validBatch.length === 0) {
-                    console.log('Batch skipped: all images out of viewport');
-                    return;
-                }
-                
-                // 只加载仍在视口内的图片
-                validBatch.forEach(({ element, data }) => {
-                    loadImageWithPlaceholder(element, data);
-                });
+                if (validBatch.length === 0) return;
+                validBatch.forEach(({ element, data }) => { loadImageWithPlaceholder(element, data); });
             }
             
-            // 带占位符的图片加载
-            function loadImageWithPlaceholder(imgElement, imgData) {
-                // 如果已经加载或正在加载，跳过
+            async function loadImageWithPlaceholder(imgElement, imgData) {
                 if (imgElement.src || imgElement.classList.contains('loaded')) return;
                 
-                // 添加加载占位符动画
-                const placeholder = document.createElement('div');
-                placeholder.className = 'img-loading-placeholder';
-                imgElement.parentElement.appendChild(placeholder);
+                const fileSize = imgData.size || 0;
+                const isLargeImage = fileSize >= CONFIG.THUMBNAIL_SIZE_THRESHOLD;
                 
-                // 🛡️ 移除：不再需要 lazyObserver.observe，避免与统一加载通路冲突
-                // IntersectionObserver 仅用于可见性检测，不触发加载
-                
-                // 触发实际加载
-                const tempImg = new Image();
-                tempImg.onload = () => {
-                    imgElement.src = imgData.url;
+                try {
+                    if (isLargeImage) {
+                        let thumbnailUrl = thumbnailCache.get(imgData.url);
+                        if (!thumbnailUrl) {
+                            thumbnailUrl = await enqueueThumbnailGeneration(imgData.url);
+                        }
+                        imgElement.src = thumbnailUrl;
+                    } else {
+                        imgElement.src = imgData.url;
+                    }
+                    
                     imgElement.classList.add('loaded');
-                    // 🛡️ 清理 scheduled 标记，允许未来重新加载
                     delete imgElement.dataset.scheduled;
-                    // 移除占位符
-                    if (placeholder.parentElement) {
-                        placeholder.remove();
-                    }
-                };
-                tempImg.onerror = () => {
-                    // 🛡️ 清理 scheduled 标记
-                    delete imgElement.dataset.scheduled;
-                    // 移除占位符，显示错误状态
-                    if (placeholder.parentElement) {
-                        placeholder.remove();
-                    }
-                    imgElement.style.display = 'none';
-                    const errorOverlay = document.createElement('div');
-                    errorOverlay.className = 'img-error';
-                    errorOverlay.innerHTML = `
-                        <div style="position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#f8f8f8; color:#999;">
-                            <div style="font-size:2rem; margin-bottom:8px;">⚠️</div>
-                            <div style="font-size:0.75rem;">加载失败</div>
-                        </div>
-                    `;
-                    imgElement.parentElement.appendChild(errorOverlay);
-                };
-                tempImg.src = imgData.url;
+                    const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
+                    if (placeholder) placeholder.remove();
+                } catch (err) {
+                    console.error('Failed to load image:', err);
+                    const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
+                    if (placeholder) placeholder.remove();
+                    // 简单错误处理：隐藏图片
+                    showErrorPlaceholder(imgElement, placeholder);
+                }
             }
 
             function onScroll() {
@@ -828,7 +961,10 @@
                     isScrolling = false;
                     // 滚动停止后恢复加载
                     observeVisibleImages();
-                }, SCROLL_STOP_DELAY);
+                    if (thumbnailQueue.length > 0) {
+                        processThumbnailQueue();
+                    }
+                }, CONFIG.SCROLL_STOP_DELAY);
                 
                 // 原有的虚拟滚动逻辑
                 if (!ticking) {
@@ -1207,7 +1343,7 @@
                     showLoading('正在扫描文件夹...', '已发现 0 张图片');
                     
                     // 先清理所有旧资源
-                    cleanupObjectUrls();
+                    cleanupAllResources();
                     
                     const images = [];
                     let scannedCount = 0;
