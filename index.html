@@ -842,8 +842,12 @@
                     <div><span class="meta-tag date">🕒 ${formatDate(img.modified)}</span></div>`;
                 card.appendChild(imgContainer);
                 card.appendChild(info);
+                // 修复：通过图片 URL 查找当前索引，避免排序后索引错乱
                 card.addEventListener('click', () => {
-                    openLightbox(globalIndex, currentDisplayImages);
+                    const currentIndex = currentDisplayImages.findIndex(item => item.url === img.url);
+                    if (currentIndex !== -1) {
+                        openLightbox(currentIndex, currentDisplayImages);
+                    }
                 });
                 return card;
             }
