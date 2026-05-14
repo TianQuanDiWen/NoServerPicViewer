@@ -1006,10 +1006,6 @@
                     
                     // 设置图片源并监听加载事件
                     await new Promise((resolve, reject) => {
-                        const timeout = setTimeout(() => {
-                            reject(new Error('Load timeout'));
-                        }, 10000); // 10秒超时
-                        
                         imgElement.onload = () => {
                             clearTimeout(timeout);
                             resolve();
@@ -1020,7 +1016,12 @@
                             reject(new Error('Image load failed'));
                         };
                         
+                        // 先设置 src，再开始计时（超时只计算实际加载时间）
                         imgElement.src = imageUrl;
+                        
+                        const timeout = setTimeout(() => {
+                            reject(new Error('Load timeout'));
+                        }, 10000); // 10秒超时
                     });
                     
                     // 加载成功
