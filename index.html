@@ -327,7 +327,7 @@
                 THUMBNAIL_MAX_HEIGHT: 300,
                 THUMBNAIL_QUALITY: 0.8,
                 LRU_CACHE_MAX_SIZE: 200,
-                LOG_LEVEL: 'warn', // 'debug' | 'info' | 'warn' | 'error' | 'none'
+                LOG_LEVEL: 'debug', // 'debug' | 'info' | 'warn' | 'error' | 'none'
             };
 
             // 日志工具函数
@@ -416,14 +416,8 @@
                     }
                 });
                 objectUrlSet.clear();
-                
-                //  同时清理所有 img 元素的 src，防止引用已释放的 URL
-                const allImages = document.querySelectorAll('.image-card img');
-                allImages.forEach(img => {
-                    if (img.src && img.src.startsWith('blob:')) {
-                        img.src = '';
-                    }
-                });
+                // ✅ 修复: 不再清空所有 img.src，避免过早释放导致图片失效
+                // 图片元素的 src 由各自的生命周期管理，在错误处理或重新调度时单独清除
             }
 
             // 工作线程池配置
@@ -612,7 +606,9 @@
             function isInViewport(imgElement) {
                 const rect = imgElement.getBoundingClientRect();
                 const viewHeight = window.innerHeight || document.documentElement.clientHeight;
-                return rect.top >= -CONFIG.VIEWPORT_BUFFER && rect.bottom <= viewHeight + CONFIG.VIEWPORT_BUFFER;
+                // ✅ 修复: 判断图片是否与扩展的视口有交集
+                // 元素底部高于视口顶部边界(含缓冲) 且 元素顶部低于视口底部边界(含缓冲)
+                return rect.bottom >= -CONFIG.VIEWPORT_BUFFER && rect.top <= viewHeight + CONFIG.VIEWPORT_BUFFER;
             }
 
             function showToast(msg){
@@ -929,62 +925,89 @@
             function observeVisibleImages() {
                 if (!lazyObserver) initLazyObserver();
                 
-                // 清除之前的分批加载定时器
                 if (loadingBatchTimer) {
                     clearTimeout(loadingBatchTimer);
                 }
                 
-                // 收集当前可见区域未加载的图片元素及其数据
                 const imgElements = visibleContent.querySelectorAll('img[data-src]');
-                const pendingImages = [];
+                const smallImages = [];
+                const largeImages = [];
                 
                 imgElements.forEach(img => {
-                    //  只处理尚未加载、未调度、无错误且在视口内的图片
                     if (!img.src && !img.classList.contains('loaded') && !img.classList.contains('error') && !img.dataset.scheduled && isInViewport(img)) {
                         const src = img.dataset.src;
-                        // 从 currentDisplayImages 中找到对应的图片数据
                         const imgData = currentDisplayImages.find(item => item.url === src);
                         if (imgData) {
-                            pendingImages.push({
-                                element: img,
-                                data: imgData
-                            });
+                            const fileSize = imgData.size || 0;
+                            if (fileSize >= CONFIG.THUMBNAIL_SIZE_THRESHOLD) {
+                                largeImages.push({ element: img, data: imgData });
+                            } else {
+                                smallImages.push({ element: img, data: imgData });
+                            }
                         }
                     }
                 });
                 
-                // 按文件大小升序排序（小文件优先加载）
-                pendingImages.sort((a, b) => (a.data.size || 0) - (b.data.size || 0));
+                smallImages.sort((a, b) => (a.data.size || 0) - (b.data.size || 0));
                 
-                // 分批调度加载 - 使用动态批次大小 + 智能暂停策略
                 let currentIndex = 0;
                 let batchDelay = 0;
                 
-                while (currentIndex < pendingImages.length) {
-                    const currentFileSize = pendingImages[currentIndex].data.size || 0;
-                    
-                    // 🎯 智能暂停：滚动中且是大图时跳过该批次及后续所有批次
-                    if (isScrolling && currentFileSize >= CONFIG.SCROLL_PAUSE_THRESHOLD) break;
-
+                while (currentIndex < smallImages.length) {
+                    const currentFileSize = smallImages[currentIndex].data.size || 0;
                     const dynamicBatchSize = getBatchSize(currentFileSize);
                     
-                    // 提取当前批次
-                    const batch = pendingImages.slice(currentIndex, currentIndex + dynamicBatchSize);
+                    const batch = smallImages.slice(currentIndex, currentIndex + dynamicBatchSize);
                     
-                    //  标记已调度，防止重复加载
                     batch.forEach(({ element }) => {
                         element.dataset.scheduled = 'true';
                     });
                     
-                    // 调度当前批次加载
                     loadingBatchTimer = setTimeout(() => {
                         loadBatchWithPlaceholder(batch);
                     }, batchDelay);
                     
-                    // 更新索引和延迟时间
                     currentIndex += dynamicBatchSize;
                     batchDelay += CONFIG.BATCH_INTERVAL;
-
+                }
+                
+                if (!isScrolling) {
+                    largeImages.forEach(({ element, data }) => {
+                        element.dataset.scheduled = 'true';
+                        
+                        scheduleWorkerTask(() => atomicThumbnailTask(data.url))
+                            .then(thumbnailUrl => {
+                                thumbnailCache.set(data.url, thumbnailUrl);
+                                
+                                log('debug', '[THUMB] Generated, now loading:', data.name);
+                                
+                                delete element.dataset.scheduled;
+                                loadImageWithPlaceholder(element, data).catch(err => {
+                                    log('error', '[THUMB] Load after generation failed:', err);
+                                });
+                            })
+                            .catch(err => {
+                                log('error', '[THUMB] Generation failed:', data.name, err);
+                                
+                                delete element.dataset.scheduled;
+                                element.src = '';
+                                
+                                showErrorState(element);
+                            });
+                    });
+                } else {
+                    if (largeImages.length > 0) {
+                        log('debug', '[PAUSE] Scroll paused, skipping', largeImages.length, 'thumbnail generation tasks');
+                    }
+                }
+            }
+            
+            // 信号量控制的并发加载函数
+            function loadWithConcurrencyLimit(tasks, concurrencyLimit) {
+                    
+            // 滚动中,记录未调度的大图数量用于日志
+                if (largeImages.length > 0) {
+                    log('debug', '[PAUSE] Scroll paused, skipping', largeImages.length, 'thumbnail generation tasks');
                 }
             }
             
@@ -1004,11 +1027,9 @@
                         console.warn('Task failed:', err);
                     }
                     
-                    // 继续执行下一个任务
                     return runNext();
                 }
                 
-                // 启动 concurrencyLimit 个并发任务
                 const workers = Array.from({ length: Math.min(concurrencyLimit, tasks.length) }, () => runNext());
                 return Promise.all(workers);
             }
@@ -1021,29 +1042,26 @@
                 
                 if (validBatch.length === 0) return;
                 
-                //  为批次添加超时保护，防止永久挂起
                 const batchTimeout = setTimeout(() => {
                     console.warn('Batch loading timeout, clearing scheduled marks');
                     validBatch.forEach(({ element }) => {
                         delete element.dataset.scheduled;
+                        element.src = '';
                     });
-                }, 15000); // 15秒超时
+                }, 15000);
                 
-                // 创建任务数组
-                const tasks = validBatch.map(({ element, data }) => 
-                    () => loadImageWithPlaceholder(element, data).catch(err => {
+                const promises = validBatch.map(({ element, data }) => 
+                    loadImageWithPlaceholder(element, data).catch(err => {
                         console.warn('Individual image load failed:', err);
                     })
                 );
                 
-                // 使用限流并发（4 个并发）
-                loadWithConcurrencyLimit(tasks, 4).finally(() => {
+                Promise.allSettled(promises).finally(() => {
                     clearTimeout(batchTimeout);
                 });
             }
             
             async function loadImageWithPlaceholder(imgElement, imgData) {
-                //  防止重复加载
                 if (imgElement.classList.contains('loaded') || imgElement.classList.contains('error')) {
                     log('debug', '[SKIP] Already loaded or error:', imgData.name);
                     return;
@@ -1052,12 +1070,12 @@
                 const fileSize = imgData.size || 0;
                 const isLargeImage = fileSize >= CONFIG.THUMBNAIL_SIZE_THRESHOLD;
                 
-                log('debug', '[LOAD] Starting load:', imgData.name, 'Size:', fileSize, 'IsLarge:', isLargeImage);
+                log('debug', '[LOAD] Starting load:', imgData.name, 'Size:', imgData.size || 0);
                 
                 try {
                     let imageUrl = imgData.url;
                     
-                    //  检查 Object URL 是否仍然有效
+                    // 检查 Object URL 是否仍然有效
                     if (!imageUrl || !imageUrl.startsWith('blob:')) {
                         log('warn', '[ERROR] Invalid Object URL:', imgData.name);
                         showErrorState(imgElement);
@@ -1067,36 +1085,29 @@
                     
                     if (isLargeImage) {
                         log('debug', '[THUMB] Processing large image:', imgData.name);
-                        // 检查缓存中是否有已生成的缩略图
                         const cachedThumbnail = thumbnailCache.get(imgData.url);
                         if (cachedThumbnail) {
                             log('debug', '[THUMB] Using cached thumbnail:', imgData.name);
-                            // 已有缓存，直接使用
                             imageUrl = cachedThumbnail;
                         } else {
                             log('debug', '[THUMB] Generating thumbnail via worker:', imgData.name);
-                            // 使用原子化工作线程处理：加载 → 生成 → 释放
                             try {
                                 const thumbnailUrl = await scheduleWorkerTask(() => 
                                     atomicThumbnailTask(imgData.url)
                                 );
                                 
-                                // 缓存缩略图
                                 thumbnailCache.set(imgData.url, thumbnailUrl);
                                 imageUrl = thumbnailUrl;
                                 log('debug', '[THUMB] Thumbnail generated successfully:', imgData.name);
                             } catch (thumbErr) {
-                                // 🔄 降级策略：原子任务失败时使用原图
-                                log('warn', '[THUMB] Atomic thumbnail task failed, using original:', imgData.name, thumbErr);
-                                imageUrl = imgData.url;
+                                log('error', '[THUMB] Thumbnail generation failed:', imgData.name, thumbErr);
+                                throw thumbErr;
                             }
                         }
                     } else {
                         log('debug', '[SMALL] Loading small image directly:', imgData.name);
                     }
                     
-                    log('debug', '[SRC] Setting img.src for:', imgData.name);
-                    // 设置图片源并监听加载事件
                     await new Promise((resolve, reject) => {
                         let timeout;
                         
@@ -1112,13 +1123,12 @@
                             reject(new Error('Image load failed'));
                         };
                         
-                        // 先设置 src，再开始计时（超时只计算实际加载时间）
                         imgElement.src = imageUrl;
                         
                         timeout = setTimeout(() => {
                             log('error', '[TIMEOUT] Load timeout:', imgData.name);
                             reject(new Error('Load timeout'));
-                        }, 15000); // 15秒超时（file://协议下I/O较慢）
+                        }, 15000);
                     });
                     
                     // 加载成功
@@ -1131,10 +1141,10 @@
                 } catch (err) {
                     log('error', '[EXCEPTION] Failed to load image:', imgData.name, err);
                     
-                    // 🔄 清除 scheduled 标记，允许重试
                     delete imgElement.dataset.scheduled;
                     
-                    // 显示错误状态
+                    imgElement.src = '';
+                    
                     showErrorState(imgElement);
                 }
             }
@@ -1144,35 +1154,29 @@
                 imgElement.classList.add('error');
                 const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
                 if (placeholder) {
-                    placeholder.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;font-size:0.8rem;">⚠️ 加载失败</div>';
+                    placeholder.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;font-size:0.8rem;">加载失败</div>';
                     placeholder.classList.add('error');
                 }
             }
+            
             function onScroll() {
-                // 标记为滚动状态
                 isScrolling = true;
                 
-                // 清除之前的恢复定时器
                 if (scrollPauseTimer) {
                     clearTimeout(scrollPauseTimer);
                 }
                 
-                // 设置滚动停止后的恢复定时器
                 scrollPauseTimer = setTimeout(() => {
                     isScrolling = false;
-                    // 滚动停止后恢复加载
                     observeVisibleImages();
-                    // 恢复工作线程队列处理
                     if (workerQueue.length > 0) {
                         processWorkerQueue();
                     }
                 }, CONFIG.SCROLL_STOP_DELAY);
                 
-                // 原有的虚拟滚动逻辑
                 if (!ticking) {
                     requestAnimationFrame(() => {
                         renderVisibleItems();
-                        // 注意：这里不调用 observeVisibleImages，由滚动停止后触发
                         ticking = false;
                     });
                     ticking = true;
@@ -1188,6 +1192,7 @@
                 if (q) {
                     filtered = filtered.filter(img => img.name.toLowerCase().includes(q));
                 }
+                
                 // 日期筛选
                 const startVal = filterDateStart.value;
                 const endVal = filterDateEnd.value;
@@ -1234,14 +1239,10 @@
                 statFolders.textContent = folderSet.size;
                 statSize.textContent = formatSize(totalSize);
                 
-                //  更新当前文件夹徽章显示 - 空字符串表示根目录（用户选择的文件夹）
+                // 更新当前文件夹徽章显示 - 空字符串表示根目录（用户选择的文件夹）
                 if (activeFolder === null) {
                     currentFolderBadge.style.display = 'none';
                 } else {
-                    currentFolderBadge.style.display = 'inline-block';
-                    // activeFolder 为空字符串时，显示根文件夹名称；否则显示子文件夹路径
-                    const displayName = activeFolder === '' ? (currentRootFolder || '根目录') : activeFolder;
-                    currentFolderBadge.textContent = `📂 ${displayName}`;
                 }
                 
                 document.querySelectorAll('.tree-item').forEach(el => el.classList.remove('active'));
