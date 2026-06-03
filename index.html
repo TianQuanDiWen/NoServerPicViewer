@@ -74,11 +74,6 @@
         }
         .stats { display:flex; gap:5px; }
         .stat { font-size:0.7rem; padding:2px 6px; border-radius:10px; background:var(--tag-bg); }
-        .current-folder-badge {
-            background: var(--accent); color: #fff; padding: 3px 10px; border-radius: 12px;
-            font-size: 0.75rem; font-weight: 500; margin: 0 4px; white-space: nowrap;
-            overflow: hidden; text-overflow: ellipsis; max-width: 200px;
-        }
         .scroll-container {
             flex:1; overflow-y:auto; overflow-x:hidden; position:relative;
             -webkit-overflow-scrolling: touch;
@@ -198,7 +193,6 @@
                 <span class="stat">📁 <span id="statFolders">0</span></span>
                 <span class="stat">💾 <span id="statSize">0 B</span></span>
             </div>
-            <span class="current-folder-badge" id="currentFolderBadge" style="display:none;"></span>
             <select id="sortSelect">
                 <option value="date-desc" selected>时间 ↓</option>
                 <option value="date-asc">时间 ↑</option>
@@ -256,7 +250,6 @@
             const lightboxFullscreen = document.getElementById('lightboxFullscreen');
             const lightboxCopy = document.getElementById('lightboxCopy');
             const toast = document.getElementById('toast');
-            const currentFolderBadge = document.getElementById('currentFolderBadge');
             const scrollContainer = document.getElementById('scrollContainer');
             const scrollPlaceholder = document.getElementById('scrollPlaceholder');
             const visibleContent = document.getElementById('visibleContent');
@@ -300,11 +293,12 @@
             
             let searchDebounceTimer = null;
             let objectUrlSet = new Set();
+            let folderSelectionInProgress = false;
+            let scanGeneration = 0;
 
             const CONFIG = {
                 VIEWPORT_BUFFER: 200,
                 ROW_OVERSCAN: 3,
-                SCROLL_PAUSE_THRESHOLD: 500 * 1024,
                 SCROLL_STOP_DELAY: 50,
                 SWIPE_THRESHOLD: 50,
                 SEARCH_DEBOUNCE: 300,
@@ -317,6 +311,7 @@
                 THUMBNAIL_MAX_HEIGHT: 300,
                 THUMBNAIL_QUALITY: 0.8,
                 LRU_CACHE_MAX_SIZE: 200,
+                MAX_RETAINED_CARDS: 500,
                 IMAGE_LOAD_STALE_TIMEOUT: 20000,
                 LOG_LEVEL: 'warn', // 'debug' | 'info' | 'warn' | 'error' | 'none'
             };
@@ -617,12 +612,6 @@
                     resizeObserver = null;
                 }
                 
-                //  断开 IntersectionObserver
-                if (lazyObserver) {
-                    lazyObserver.disconnect();
-                    lazyObserver = null;
-                }
-                
                 console.log('All resources cleaned up');
             }
             
@@ -638,15 +627,8 @@
             }
             function escapeHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
             
-            function showErrorPlaceholder(imgElement, placeholder) {
-                if (placeholder) {
-                    placeholder.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;font-size:0.8rem;">⚠️ 加载失败</div>';
-                    placeholder.classList.add('error');
-                }
-                imgElement.style.display = 'none';
-            }
-            
             function isInViewport(imgElement) {
+                if (!imgElement.isConnected) return false;
                 const rect = imgElement.getBoundingClientRect();
                 const viewHeight = window.innerHeight || document.documentElement.clientHeight;
                 // ✅ 修复: 判断图片是否与扩展的视口有交集
@@ -864,6 +846,7 @@
                 
                 const newVisibleIds = new Set();
                 const colWidth = (containerWidth - gap * (columnCount - 1)) / columnCount;
+                const now = Date.now();
                 
                 for (let i = startIndex; i < endIndex; i++) {
                     const img = currentDisplayImages[i];
@@ -888,6 +871,7 @@
                         card.style.top = top + 'px';
                         card.dataset.index = i;
                     }
+                    card.dataset.lastVisibleAt = String(now);
                 }
                 
                 existingCards.forEach(card => {
@@ -895,6 +879,15 @@
                         card.style.display = 'none';
                     }
                 });
+
+                const retainedCards = Array.from(visibleContent.children);
+                if (retainedCards.length > CONFIG.MAX_RETAINED_CARDS) {
+                    const hiddenCards = retainedCards
+                        .filter(card => card.style.display === 'none')
+                        .sort((a, b) => Number(a.dataset.lastVisibleAt || 0) - Number(b.dataset.lastVisibleAt || 0));
+                    const removeCount = retainedCards.length - CONFIG.MAX_RETAINED_CARDS;
+                    hiddenCards.slice(0, removeCount).forEach(card => card.remove());
+                }
                 
                 scrollPlaceholder.style.height = getTotalHeight() + 'px';
             }
@@ -941,35 +934,7 @@
                 return card;
             }
 
-            let lazyObserver = null;
-            function initLazyObserver() {
-                // 先断开旧实例，防止实例累积
-                if (lazyObserver) {
-                    lazyObserver.disconnect();
-                }
-                
-                //  修改：IntersectionObserver 仅用于可见性检测，不直接触发加载
-                // 所有加载统一由 loadImageWithPlaceholder 控制，避免重复加载
-                lazyObserver = new IntersectionObserver((entries) => {
-                    entries.forEach(entry => {
-                        if (entry.isIntersecting) {
-                            const img = entry.target;
-                            // 仅标记为可见，不直接设置 src
-                            // 实际加载由 observeVisibleImages 中的分批调度控制
-                            img.dataset.visible = 'true';
-                        } else {
-                            const img = entry.target;
-                            delete img.dataset.visible;
-                        }
-                    });
-                }, { root: scrollContainer, rootMargin: '200px', threshold: 0.01 });
-                
-                // 保存实例引用以便后续清理
-                lazyObserverInstance = lazyObserver;
-            }
-
             function observeVisibleImages() {
-                if (!lazyObserver) initLazyObserver();
                 const generation = loadGeneration;
                 resetStaleLoadingImages();
                 
@@ -1033,6 +998,7 @@
                             .then(thumbnailUrl => {
                                 if (generation !== loadGeneration) return;
                                 thumbnailCache.set(data.url, thumbnailUrl);
+                                if (!element.isConnected) return;
                                 
                                 log('debug', '[THUMB] Generated, now loading:', data.name);
                                 
@@ -1067,27 +1033,6 @@
             }
             
             // 信号量控制的并发加载函数
-            function loadWithConcurrencyLimit(tasks, concurrencyLimit) {
-                let index = 0;
-                
-                async function runNext() {
-                    if (index >= tasks.length) return;
-                    
-                    const taskIndex = index++;
-                    const task = tasks[taskIndex];
-                    
-                    try {
-                        await task();
-                    } catch (err) {
-                        console.warn('Task failed:', err);
-                    }
-                    
-                    return runNext();
-                }
-                
-                const workers = Array.from({ length: Math.min(concurrencyLimit, tasks.length) }, () => runNext());
-                return Promise.all(workers);
-            }
             
             // 分批加载图片并显示占位符
             function loadBatchWithPlaceholder(batch, generation = loadGeneration) {
@@ -1130,6 +1075,7 @@
             
             async function loadImageWithPlaceholder(imgElement, imgData, generation = loadGeneration) {
                 if (generation !== loadGeneration) return;
+                if (!imgElement.isConnected) return;
                 if (imgElement.classList.contains('loaded') || imgElement.classList.contains('error')) {
                     resetImageLoadState(imgElement);
                     log('debug', '[SKIP] Already loaded or error:', imgData.name);
@@ -1291,12 +1237,6 @@
                 }
                 statFolders.textContent = folderSet.size;
                 statSize.textContent = formatSize(totalSize);
-                
-                // 更新当前文件夹徽章显示 - 空字符串表示根目录（用户选择的文件夹）
-                if (activeFolder === null) {
-                    currentFolderBadge.style.display = 'none';
-                } else {
-                }
                 
                 document.querySelectorAll('.tree-item').forEach(el => el.classList.remove('active'));
                 
@@ -1500,7 +1440,7 @@
                 } else if (e.touches.length === 1 && currentScale <= 1 && !isPanning) {
                     // 单指滑动检测（用于切换图片）
                     const deltaX = e.touches[0].clientX - startX;
-                    if (Math.abs(deltaX) > 50) {
+                    if (Math.abs(deltaX) > CONFIG.SWIPE_THRESHOLD) {
                         // 滑动距离超过50px，触发切换
                         if (deltaX > 0) {
                             navLightbox(-1); // 向右滑，上一张
@@ -1633,12 +1573,23 @@
                 searchDebounceTimer = setTimeout(() => {
                     scrollContainer.scrollTop = 0;
                     updateDisplay();
-                }, 300);
+                }, CONFIG.SEARCH_DEBOUNCE);
             });
 
             async function handleSelectFolder() {
+                if (folderSelectionInProgress) {
+                    showToast('正在处理当前文件夹，请稍候');
+                    return;
+                }
+
+                folderSelectionInProgress = true;
+                const originalButtonText = selectFolderBtn.textContent;
+                selectFolderBtn.disabled = true;
+
                 try {
                     const dirHandle = await window.showDirectoryPicker();
+                    const generation = ++scanGeneration;
+                    selectFolderBtn.textContent = '扫描中...';
 
                     // 先清理所有旧资源
                     cleanupAllResources();
@@ -1658,7 +1609,7 @@
                     let scanning = true;
 
                     function renderScanPreview() {
-                        if (!scanning) return;
+                        if (!scanning || generation !== scanGeneration) return;
                         const previewImages = getFilteredImages();
                         currentDisplayImages = previewImages;
                         statImages.textContent = previewImages.length;
@@ -1683,6 +1634,7 @@
                     }
 
                     function scheduleScanRender() {
+                        if (generation !== scanGeneration) return;
                         if (renderScheduled) return;
                         renderScheduled = true;
                         requestAnimationFrame(() => {
@@ -1692,12 +1644,15 @@
                     }
                     
                     async function scanDirHandle(handle, pathPrefix = '') {
+                        if (generation !== scanGeneration) return;
                         const currentPath = normalizePath(pathPrefix);
                         for await (const entry of handle.values()) {
+                            if (generation !== scanGeneration) return;
                             if (entry.kind === 'file') {
                                 const ext = entry.name.split('.').pop().toLowerCase();
                                 if (imageExtensions.has(ext)) {
                                     const file = await entry.getFile();
+                                    if (generation !== scanGeneration) return;
                                     const url = URL.createObjectURL(file);
                                     // 将创建的 URL 加入跟踪集合
                                     objectUrlSet.add(url);
@@ -1724,6 +1679,7 @@
                         }
                     }
                     await scanDirHandle(dirHandle);
+                    if (generation !== scanGeneration) return;
 
                     scanning = false;
                     folderTree = buildFolderTree(allImages, currentRootFolder);
@@ -1734,6 +1690,10 @@
                     if (err.name !== 'AbortError') {
                         showToast('❌ 无法读取文件夹：' + err.message);
                     }
+                } finally {
+                    folderSelectionInProgress = false;
+                    selectFolderBtn.disabled = false;
+                    selectFolderBtn.textContent = originalButtonText;
                 }
             }
             selectFolderBtn.addEventListener('click', handleSelectFolder);
@@ -1761,7 +1721,6 @@
                 window.addEventListener('resize', handleResize);
             }
 
-            initLazyObserver();
             folderTree = null;
             renderTree();
             updateDisplay();
