@@ -33,8 +33,10 @@
             background: var(--sidebar-bg); border-right: 1px solid var(--border);
             display: flex; flex-direction: column; height: 100%;
             overflow-y: auto; overflow-x: hidden;
-            z-index: 50; transition: transform 0.3s;
+            z-index: 50; flex-shrink: 0;
+            transition: margin-left 0.3s ease, transform 0.3s ease;
         }
+        .sidebar.collapsed { transform: translateX(-100%); margin-left: calc(-1 * var(--sidebar-width)); border-right: 0; }
         .sidebar-header { padding: 14px 16px; font-weight: 700; font-size: 1rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
         .tree-container { flex: 1; padding: 8px 0; overflow-y: auto; }
         .tree-item {
@@ -84,13 +86,14 @@
         .image-card {
             background:var(--card-bg); border-radius:12px; overflow:hidden;
             border:1px solid var(--border); box-shadow:var(--shadow); cursor:pointer;
-            transition:transform 0.2s, box-shadow 0.2s; display:flex; flex-direction:column;
-            position:absolute;
+            transition:box-shadow 0.2s; display:flex; flex-direction:column;
+            position:absolute; top:0; left:0;
         }
-        .image-card:hover { transform:translateY(-3px); box-shadow:var(--shadow-hover); }
+        .image-card:hover { box-shadow:var(--shadow-hover); }
+        .image-card:hover .img-container { transform:translateY(-3px); }
         .img-container {
             width:100%; aspect-ratio:4/3; background:#e0e0e5;
-            position:relative; overflow:hidden;
+            position:relative; overflow:hidden; transition:transform 0.2s;
         }
         .img-container img {
             width:100%; height:100%; object-fit:cover; display:block;
@@ -168,7 +171,7 @@
             .sidebar-toggle { display: inline-flex !important; }
             .main-area { width: 100%; }
         }
-        .sidebar-toggle { display: none; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 5px 8px; cursor: pointer; font-size: 1.1rem; }
+        .sidebar-toggle { display: inline-flex; align-items:center; justify-content:center; width:32px; height:32px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 0; cursor: pointer; font-size: 1.1rem; line-height:1; }
     </style>
 </head>
 <body>
@@ -181,7 +184,7 @@
 
     <div class="main-area">
         <nav class="navbar">
-            <button class="btn sidebar-toggle" id="sidebarToggleBtn" onclick="toggleSidebar()" style="display:none;">☰</button>
+            <button class="btn sidebar-toggle" id="sidebarToggleBtn" onclick="toggleSidebar()" aria-label="切换侧边栏">☰</button>
             <span class="logo">🖼️ 图片浏览器</span>
             <button class="btn primary" id="selectFolderBtn">📂 选择本地文件夹</button>
             <div class="search-wrapper">
@@ -653,17 +656,78 @@
                 return p.replace(/\\/g, '/').trim().replace(/\/+$/, '');
             }
 
+            const SIDEBAR_STORAGE_KEY = 'picviewer_sidebar_collapsed';
+
+            function isMobileLayout() {
+                return window.innerWidth <= 768;
+            }
+
+            function updateSidebarToggleIcon() {
+                const btn = document.getElementById('sidebarToggleBtn');
+                const sidebar = document.getElementById('sidebar');
+                if (!btn) return;
+                if (isMobileLayout()) {
+                    btn.textContent = sidebar.classList.contains('open') ? '✕' : '☰';
+                } else {
+                    btn.textContent = sidebar.classList.contains('collapsed') ? '▶' : '◀';
+                }
+            }
+
             window.toggleSidebar = function() {
                 const sidebar = document.getElementById('sidebar');
                 const overlay = document.getElementById('sidebarOverlay');
-                if (sidebar.classList.contains('open')) {
+                if (isMobileLayout()) {
+                    // 移动端：open 类 + 遮罩
+                    if (sidebar.classList.contains('open')) {
+                        sidebar.classList.remove('open');
+                        overlay.style.display = 'none';
+                    } else {
+                        sidebar.classList.add('open');
+                        overlay.style.display = 'block';
+                    }
+                } else {
+                    // 桌面端：collapsed 类切换 + localStorage 记忆 + 无遮罩
+                    const willCollapse = !sidebar.classList.contains('collapsed');
+                    sidebar.classList.toggle('collapsed');
+                    overlay.style.display = 'none';
+                    try { localStorage.setItem(SIDEBAR_STORAGE_KEY, willCollapse ? '1' : '0'); } catch(e) {}
+
+                    // 侧边栏过渡结束后立即刷新布局 — 不经过 ResizeObserver 的 150ms debounce，
+                    // 消除折叠/展开后"顿一下"的视觉体验。ResizeObserver 仍然保留用于窗口/DPR 缩放。
+                    const onSidebarTransitionEnd = function(e) {
+                        if (e.propertyName !== 'margin-left') return; // 只响应 margin-left 结束（忽略 transform）
+                        requestLayoutRefresh();
+                    };
+                    sidebar.addEventListener('transitionend', onSidebarTransitionEnd, { once: true });
+                }
+                updateSidebarToggleIcon();
+            };
+
+            function requestLayoutRefresh() {
+                updateLayoutParams();
+                renderedStartIndex = -1;
+                renderedEndIndex = -1;
+                renderVisibleItems();
+                observeVisibleImages();
+            }
+
+            function applySavedSidebarState() {
+                const sidebar = document.getElementById('sidebar');
+                const overlay = document.getElementById('sidebarOverlay');
+                if (isMobileLayout()) {
+                    sidebar.classList.remove('collapsed');
                     sidebar.classList.remove('open');
                     overlay.style.display = 'none';
                 } else {
-                    sidebar.classList.add('open');
-                    overlay.style.display = 'block';
+                    let collapsed = false;
+                    try { collapsed = localStorage.getItem(SIDEBAR_STORAGE_KEY) === '1'; } catch(e) {}
+                    if (collapsed) sidebar.classList.add('collapsed');
+                    else sidebar.classList.remove('collapsed');
+                    sidebar.classList.remove('open');
+                    overlay.style.display = 'none';
                 }
-            };
+                updateSidebarToggleIcon();
+            }
 
             function buildFolderTree(images, rootFolderName = '') {
                 //  使用空路径作为根，直接使用用户选择的文件夹名称
@@ -875,13 +939,12 @@
                     if (!card) {
                         card = createCardElement(img, i);
                         card.style.width = colWidth + 'px';
-                        card.style.left = left + 'px';
-                        card.style.top = top + 'px';
+                        card.style.transform = `translate(${left}px, ${top}px)`;
                         visibleContent.appendChild(card);
                     } else {
                         card.style.display = '';
-                        card.style.left = left + 'px';
-                        card.style.top = top + 'px';
+                        card.style.width = colWidth + 'px';
+                        card.style.transform = `translate(${left}px, ${top}px)`;
                         card.dataset.index = i;
                     }
                     card.dataset.lastVisibleAt = String(now);
@@ -936,10 +999,6 @@
                     <div><span class="meta-tag date">🕒 ${formatDate(img.modified)}</span></div>`;
                 card.appendChild(imgContainer);
                 card.appendChild(info);
-                card.addEventListener('click', () => {
-                    const found = findImageByUrl(img.url);
-                    if (found) openLightbox(found.index, currentDisplayImages);
-                });
                 return card;
             }
 
@@ -1748,17 +1807,31 @@
             selectFolderBtn.addEventListener('click', handleSelectFolder);
 
             scrollContainer.addEventListener('scroll', onScroll, { passive: true });
+
+            visibleContent.addEventListener('click', (e) => {
+                const card = e.target.closest('.image-card');
+                if (!card) return;
+                const idx = imageIndex.get(card.dataset.imageId);
+                if (idx !== undefined) openLightbox(idx, currentDisplayImages);
+            });
             
             // 优先使用 ResizeObserver，resize 事件作为降级方案并添加防抖
             let resizeDebounceTimer = null;
             const handleResize = () => {
                 clearTimeout(resizeDebounceTimer);
                 resizeDebounceTimer = setTimeout(() => {
-                    updateLayoutParams();
-                    renderedStartIndex = -1;
-                    renderedEndIndex = -1;
-                    renderVisibleItems();
-                    observeVisibleImages();
+                    // 断点跨越时清理不匹配的状态类，防止桌面/移动状态混淆
+                    const sidebar = document.getElementById('sidebar');
+                    const overlay = document.getElementById('sidebarOverlay');
+                    if (isMobileLayout()) {
+                        sidebar.classList.remove('collapsed');
+                    } else {
+                        sidebar.classList.remove('open');
+                        overlay.style.display = 'none';
+                        applySavedSidebarState(); // 仅管理类，不触发刷新
+                    }
+                    // 统一的虚拟列表布局刷新入口
+                    requestLayoutRefresh();
                 }, 150);
             };
             
@@ -1770,9 +1843,59 @@
                 window.addEventListener('resize', handleResize);
             }
 
+            // 监听浏览器页面缩放（Ctrl+滚轮/+/−）：这类操作仅改变 devicePixelRatio，
+            // scrollContainer.clientWidth（CSS 像素）保持不变，ResizeObserver 不会触发。
+            // 通过 matchMedia 监听 DPR 变化，变化时也重新布局。
+            (function setupDprListener() {
+                if (!window.matchMedia) return;
+                let currentMq = null;
+
+                function bindDprListener() {
+                    try {
+                        const mq = window.matchMedia('(resolution: ' + window.devicePixelRatio + 'dppx)');
+                        const onDprChange = function() {
+                            // 解绑旧的 matchMedia 监听器，防止内存泄漏
+                            if (currentMq) {
+                                if (currentMq.removeEventListener) {
+                                    currentMq.removeEventListener('change', onDprChange);
+                                } else if (currentMq.removeListener) {
+                                    currentMq.removeListener(onDprChange);
+                                }
+                            }
+                            handleResize();
+                            // 基于新的 DPR 重新绑定下一次监听（matchMedia 的 query 需要动态更新）
+                            bindDprListener();
+                        };
+                        if (mq.addEventListener) {
+                            mq.addEventListener('change', onDprChange);
+                        } else if (mq.addListener) {
+                            mq.addListener(onDprChange);
+                        }
+                        currentMq = mq;
+                    } catch (e) {}
+                }
+                bindDprListener();
+            })();
+
             folderTree = null;
             renderTree();
             updateDisplay();
+
+            // 初始化侧边栏状态：禁用过渡，直接应用目标状态。避免页面加载时产生"折叠动画"，
+            // 同时确保随后的 requestLayoutRefresh 能测量到正确的最终尺寸。
+            (function initSidebarState() {
+                const sidebar = document.getElementById('sidebar');
+                const overlay = document.getElementById('sidebarOverlay');
+                const savedTransition = sidebar.style.transition;
+                sidebar.style.transition = 'none';
+                applySavedSidebarState();
+                // 强制同步布局，让浏览器立即应用 no-transition 的样式
+                void scrollContainer.clientWidth;
+                sidebar.style.transition = savedTransition;
+                // 确保 overlay 的初始状态正确
+                overlay.style.display = 'none';
+            })();
+            requestLayoutRefresh();
             
             //  保存清理函数引用，用于页面卸载时移除 resize 监听器
             const cleanupResizeListener = () => {
