@@ -261,6 +261,7 @@
             const clearFilterBtn = document.getElementById('clearFilterBtn');
 
             let allImages = [];
+            let imageIndex = new Map();
             let folderTree = null;
             let activeFolder = null;
             let currentRootFolder = ''; //  存储用户选择的根文件夹名称
@@ -268,6 +269,7 @@
             const imageExtensions = new Set(['jpg','jpeg','png','gif','webp','bmp','svg','tiff','tif','avif','ico','heic','heif','jfif']);
             
             let rowHeight = 260;
+            let measuredRowHeight = null;
             let columnCount = 4;
             let containerWidth = 0;
             let gap = 12;
@@ -402,8 +404,6 @@
                     }
                 });
                 objectUrlSet.clear();
-                // ✅ 修复: 不再清空所有 img.src，避免过早释放导致图片失效
-                // 图片元素的 src 由各自的生命周期管理，在错误处理或重新调度时单独清除
             }
 
             // 工作线程池配置
@@ -625,14 +625,21 @@
                 const d=new Date(ms);
                 return d.getFullYear()+'-'+(d.getMonth()+1).toString().padStart(2,'0')+'-'+d.getDate().toString().padStart(2,'0');
             }
-            function escapeHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+            // 高效的 HTML 转义（避免每次创建 DOM 元素）
+            function escapeHtml(s) {
+                if (s === null || s === undefined) return '';
+                return String(s)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
             
             function isInViewport(imgElement) {
                 if (!imgElement.isConnected) return false;
                 const rect = imgElement.getBoundingClientRect();
                 const viewHeight = window.innerHeight || document.documentElement.clientHeight;
-                // ✅ 修复: 判断图片是否与扩展的视口有交集
-                // 元素底部高于视口顶部边界(含缓冲) 且 元素顶部低于视口底部边界(含缓冲)
                 return rect.bottom >= -CONFIG.VIEWPORT_BUFFER && rect.top <= viewHeight + CONFIG.VIEWPORT_BUFFER;
             }
 
@@ -791,6 +798,9 @@
             }
 
             function measureRowHeight() {
+                // 如果已有缓存的测量结果，直接返回
+                if (measuredRowHeight !== null) return measuredRowHeight;
+
                 const tempCard = createCardElement({ url: '', name: '测量用', folder: '测试', size: 1024, modified: Date.now() }, 0);
                 tempCard.style.position = 'fixed';
                 tempCard.style.visibility = 'hidden';
@@ -801,16 +811,19 @@
                 document.body.appendChild(tempCard);
                 const height = tempCard.getBoundingClientRect().height;
                 document.body.removeChild(tempCard);
-                return height || 260;
+                measuredRowHeight = height || 260;
+                return measuredRowHeight;
             }
 
             function updateLayoutParams() {
-                const oldWidth = containerWidth;
+                const oldColumnCount = columnCount;
                 containerWidth = scrollContainer.clientWidth;
                 if (containerWidth <= 0) return;
                 const minColWidth = 180;
                 columnCount = Math.max(1, Math.floor((containerWidth + gap) / (minColWidth + gap)));
-                if (containerWidth !== oldWidth || rowHeight === 260) {
+                // 列数变化或首次调用时重新测量
+                if (oldColumnCount !== columnCount || rowHeight === 260) {
+                    measuredRowHeight = null;
                     rowHeight = measureRowHeight();
                 }
             }
@@ -905,7 +918,6 @@
                 imageEl.dataset.src = img.url;
                 imageEl.alt = img.name;
                 imageEl.setAttribute('decoding', 'async');
-                imageEl.setAttribute('loading', 'lazy');
                 imageEl.style.width = '100%';
                 imageEl.style.height = '100%';
                 
@@ -924,12 +936,9 @@
                     <div><span class="meta-tag date">🕒 ${formatDate(img.modified)}</span></div>`;
                 card.appendChild(imgContainer);
                 card.appendChild(info);
-                // 修复：通过图片 URL 查找当前索引，避免排序后索引错乱
                 card.addEventListener('click', () => {
-                    const currentIndex = currentDisplayImages.findIndex(item => item.url === img.url);
-                    if (currentIndex !== -1) {
-                        openLightbox(currentIndex, currentDisplayImages);
-                    }
+                    const found = findImageByUrl(img.url);
+                    if (found) openLightbox(found.index, currentDisplayImages);
                 });
                 return card;
             }
@@ -953,9 +962,9 @@
                 
                 imgElements.forEach(img => {
                     if (!img.src && !img.classList.contains('loaded') && !img.classList.contains('error') && !img.dataset.scheduled && isInViewport(img)) {
-                        const src = img.dataset.src;
-                        const imgData = currentDisplayImages.find(item => item.url === src);
-                        if (imgData) {
+                        const found = findImageByUrl(img.dataset.src);
+                        if (found) {
+                            const imgData = found.data;
                             const fileSize = imgData.size || 0;
                             if (fileSize >= CONFIG.THUMBNAIL_SIZE_THRESHOLD) {
                                 largeImages.push({ element: img, data: imgData });
@@ -990,49 +999,39 @@
                     batchDelay += CONFIG.BATCH_INTERVAL;
                 }
                 
-                if (!isScrolling) {
-                    largeImages.forEach(({ element, data }) => {
-                        markImageScheduled(element, 'large');
-                        
-                        scheduleWorkerTask(() => atomicThumbnailTask(data.url))
-                            .then(thumbnailUrl => {
-                                if (generation !== loadGeneration) return;
-                                thumbnailCache.set(data.url, thumbnailUrl);
-                                if (!element.isConnected) return;
-                                
-                                log('debug', '[THUMB] Generated, now loading:', data.name);
-                                
-                                resetImageLoadState(element);
-                                loadImageWithPlaceholder(element, data, generation).catch(err => {
-                                    log('error', '[THUMB] Load after generation failed:', err);
-                                });
-                            })
-                            .catch(err => {
-                                if (generation !== loadGeneration) return;
-                                log('error', '[THUMB] Generation failed:', data.name, err);
-                                
-                                resetImageLoadState(element, true);
-                                
-                                showErrorState(element);
-                            });
-                    });
-                } else {
-                    if (largeImages.length > 0) {
-                        log('debug', '[PAUSE] Scroll paused, skipping', largeImages.length, 'thumbnail generation tasks');
-                    }
-                }
-            }
-            
-            // 信号量控制的并发加载函数
-            function loadWithConcurrencyLimit(tasks, concurrencyLimit) {
+                // 滚动中也处理少量大图，避免持续滚动时页面长时间空白
+                const maxLargeImages = isScrolling ? 2 : largeImages.length;
+                const largeImagesToProcess = largeImages.slice(0, maxLargeImages);
+
+                largeImagesToProcess.forEach(({ element, data }) => {
+                    markImageScheduled(element, 'large');
                     
-            // 滚动中,记录未调度的大图数量用于日志
-                if (largeImages.length > 0) {
-                    log('debug', '[PAUSE] Scroll paused, skipping', largeImages.length, 'thumbnail generation tasks');
+                    scheduleWorkerTask(() => atomicThumbnailTask(data.url))
+                        .then(thumbnailUrl => {
+                            if (generation !== loadGeneration) return;
+                            thumbnailCache.set(data.url, thumbnailUrl);
+                            if (!element.isConnected) return;
+                            
+                            log('debug', '[THUMB] Generated, now loading:', data.name);
+                            
+                            resetImageLoadState(element);
+                            loadImageWithPlaceholder(element, data, generation).catch(err => {
+                                log('error', '[THUMB] Load after generation failed:', err);
+                            });
+                        })
+                        .catch(err => {
+                            if (generation !== loadGeneration) return;
+                            log('error', '[THUMB] Generation failed:', data.name, err);
+                            
+                            resetImageLoadState(element, true);
+                            showErrorState(element);
+                        });
+                });
+
+                if (isScrolling && largeImages.length > maxLargeImages) {
+                    log('debug', '[PAUSE] Scrolling, deferred', largeImages.length - maxLargeImages, 'thumbnail tasks');
                 }
             }
-            
-            // 信号量控制的并发加载函数
             
             // 分批加载图片并显示占位符
             function loadBatchWithPlaceholder(batch, generation = loadGeneration) {
@@ -1076,106 +1075,142 @@
             async function loadImageWithPlaceholder(imgElement, imgData, generation = loadGeneration) {
                 if (generation !== loadGeneration) return;
                 if (!imgElement.isConnected) return;
-                if (imgElement.classList.contains('loaded') || imgElement.classList.contains('error')) {
-                    resetImageLoadState(imgElement);
-                    log('debug', '[SKIP] Already loaded or error:', imgData.name);
-                    return;
-                }
+                if (imgElement.classList.contains('loaded')) return;
                 
                 const fileSize = imgData.size || 0;
                 const isLargeImage = fileSize >= CONFIG.THUMBNAIL_SIZE_THRESHOLD;
+                const maxRetries = 2;
+                let attempt = 0;
                 
-                log('debug', '[LOAD] Starting load:', imgData.name, 'Size:', imgData.size || 0);
-                
-                try {
-                    let imageUrl = imgData.url;
-                    
-                    // 检查 Object URL 是否仍然有效
-                    if (!imageUrl || !imageUrl.startsWith('blob:')) {
-                        log('warn', '[ERROR] Invalid Object URL:', imgData.name);
-                        showErrorState(imgElement);
-                        resetImageLoadState(imgElement);
-                        return;
-                    }
-                    
-                    if (isLargeImage) {
-                        log('debug', '[THUMB] Processing large image:', imgData.name);
-                        const cachedThumbnail = thumbnailCache.get(imgData.url);
-                        if (cachedThumbnail) {
-                            log('debug', '[THUMB] Using cached thumbnail:', imgData.name);
-                            imageUrl = cachedThumbnail;
-                        } else {
-                            log('debug', '[THUMB] Generating thumbnail via worker:', imgData.name);
-                            try {
-                                const thumbnailUrl = await scheduleWorkerTask(() => 
-                                    atomicThumbnailTask(imgData.url)
-                                );
-                                if (generation !== loadGeneration) return;
-                                
-                                thumbnailCache.set(imgData.url, thumbnailUrl);
-                                imageUrl = thumbnailUrl;
-                                log('debug', '[THUMB] Thumbnail generated successfully:', imgData.name);
-                            } catch (thumbErr) {
-                                log('error', '[THUMB] Thumbnail generation failed:', imgData.name, thumbErr);
-                                throw thumbErr;
+                while (attempt <= maxRetries) {
+                    attempt++;
+                    try {
+                        let imageUrl = imgData.url;
+                        
+                        if (!imageUrl || !imageUrl.startsWith('blob:')) {
+                            log('warn', '[ERROR] Invalid Object URL:', imgData.name);
+                            showErrorState(imgElement, '图片链接失效');
+                            return;
+                        }
+                        
+                        if (isLargeImage) {
+                            const cachedThumbnail = thumbnailCache.get(imgData.url);
+                            if (cachedThumbnail) {
+                                imageUrl = cachedThumbnail;
+                            } else {
+                                try {
+                                    const thumbnailUrl = await scheduleWorkerTask(() => 
+                                        atomicThumbnailTask(imgData.url)
+                                    );
+                                    if (generation !== loadGeneration) return;
+                                    thumbnailCache.set(imgData.url, thumbnailUrl);
+                                    imageUrl = thumbnailUrl;
+                                } catch (thumbErr) {
+                                    log('warn', '[THUMB] Failed, falling back to original:', imgData.name);
+                                    // 缩略图失败则回退到原图加载
+                                }
                             }
                         }
-                    } else {
-                        log('debug', '[SMALL] Loading small image directly:', imgData.name);
+                        
+                        const loaded = await new Promise((resolve, reject) => {
+                            let timeout;
+                            
+                            imgElement.onload = () => {
+                                clearTimeout(timeout);
+                                resolve(true);
+                            };
+                            imgElement.onerror = () => {
+                                clearTimeout(timeout);
+                                if (imgElement.complete && imgElement.naturalWidth > 0) {
+                                    resolve(true);
+                                } else {
+                                    reject(new Error('Image load failed'));
+                                }
+                            };
+                            
+                            imgElement.dataset.loadingStarted = String(Date.now());
+                            imgElement.src = imageUrl;
+                            
+                            timeout = setTimeout(() => {
+                                if (imgElement.complete && imgElement.naturalWidth > 0) {
+                                    resolve(true);
+                                } else {
+                                    reject(new Error('Load timeout'));
+                                }
+                            }, 30000);
+                        });
+                        
+                        if (generation !== loadGeneration) return;
+                        if (!loaded) continue;
+                        
+                        imgElement.classList.add('loaded');
+                        resetImageLoadState(imgElement);
+                        const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
+                        if (placeholder) placeholder.remove();
+                        return;
+                        
+                    } catch (err) {
+                        if (generation !== loadGeneration) return;
+                        log('warn', `[RETRY ${attempt}/${maxRetries + 1}] Load issue:`, imgData.name, err.message);
+                        
+                        // 重试前清理状态
+                        resetImageLoadState(imgElement);
+                        imgElement.src = '';
+                        imgElement.removeAttribute('src');
+                        
+                        // 最后一次仍失败，标记错误
+                        if (attempt > maxRetries) {
+                            showErrorState(imgElement, '加载失败（点击重试）', () => {
+                                // 点击错误区域重新触发加载
+                                showRetryState(imgElement);
+                                observeVisibleImages();
+                            });
+                            return;
+                        }
+                        
+                        // 简单的退避延迟
+                        await new Promise(r => setTimeout(r, 300 * attempt));
                     }
-                    
-                    await new Promise((resolve, reject) => {
-                        let timeout;
-                        
-                        imgElement.onload = () => {
-                            clearTimeout(timeout);
-                            log('info', '[OK] Image loaded successfully:', imgData.name);
-                            resolve();
-                        };
-                        
-                        imgElement.onerror = () => {
-                            clearTimeout(timeout);
-                            log('error', '[ERROR] Image load failed:', imgData.name);
-                            reject(new Error('Image load failed'));
-                        };
-                        
-                        imgElement.dataset.loadingStarted = String(Date.now());
-                        imgElement.src = imageUrl;
-                        
-                        timeout = setTimeout(() => {
-                            log('error', '[TIMEOUT] Load timeout:', imgData.name);
-                            reject(new Error('Load timeout'));
-                        }, 15000);
-                    });
-                    
-                    if (generation !== loadGeneration) return;
-
-                    // 加载成功
-                    imgElement.classList.add('loaded');
-                    resetImageLoadState(imgElement);
-                    const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
-                    if (placeholder) placeholder.remove();
-                    log('debug', '[DONE] Image processing complete:', imgData.name);
-                    
-                } catch (err) {
-                    if (generation !== loadGeneration) return;
-                    log('error', '[EXCEPTION] Failed to load image:', imgData.name, err);
-                    
-                    resetImageLoadState(imgElement);
-                    
-                    imgElement.src = '';
-                    
-                    showErrorState(imgElement);
                 }
             }
             
-            // 显示错误状态（保留占位符显示错误信息）
-            function showErrorState(imgElement) {
+            // 显示错误状态，支持点击重试
+            function showErrorState(imgElement, message = '加载失败', onClick = null) {
                 imgElement.classList.add('error');
-                const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
-                if (placeholder) {
-                    placeholder.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;font-size:0.8rem;">加载失败</div>';
-                    placeholder.classList.add('error');
+                const container = imgElement.parentElement;
+                if (!container) return;
+                let placeholder = container.querySelector('.img-loading-placeholder');
+                if (!placeholder) {
+                    placeholder = document.createElement('div');
+                    placeholder.className = 'img-loading-placeholder error';
+                    container.appendChild(placeholder);
+                }
+                placeholder.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;font-size:0.8rem;cursor:pointer;padding:8px;text-align:center;" title="点击重试">${escapeHtml(message)}</div>`;
+                placeholder.classList.add('error');
+                if (onClick) {
+                    placeholder.querySelector('div').onclick = (e) => {
+                        e.stopPropagation();
+                        onClick();
+                    };
+                }
+            }
+            
+            // 重置为重新加载状态
+            function showRetryState(imgElement) {
+                imgElement.classList.remove('error');
+                imgElement.classList.remove('loaded');
+                resetImageLoadState(imgElement);
+                const container = imgElement.parentElement;
+                if (container) {
+                    const placeholder = container.querySelector('.img-loading-placeholder');
+                    if (placeholder) {
+                        placeholder.classList.remove('error');
+                        placeholder.innerHTML = '';
+                    } else {
+                        const newPlaceholder = document.createElement('div');
+                        newPlaceholder.className = 'img-loading-placeholder';
+                        container.insertBefore(newPlaceholder, container.firstChild);
+                    }
                 }
             }
             
@@ -1203,6 +1238,34 @@
                 }
             }
 
+            function updateStats(images) {
+                statImages.textContent = images.length;
+                const folderSet = new Set();
+                let totalSize = 0;
+                for (let i = 0; i < images.length; i++) {
+                    const img = images[i];
+                    folderSet.add(normalizePath(img.folder || '根目录'));
+                    totalSize += img.size || 0;
+                }
+                statFolders.textContent = folderSet.size;
+                statSize.textContent = formatSize(totalSize);
+            }
+
+            function rebuildImageIndex() {
+                imageIndex.clear();
+                for (let i = 0; i < currentDisplayImages.length; i++) {
+                    imageIndex.set(currentDisplayImages[i].url, i);
+                }
+            }
+
+            function findImageByUrl(url) {
+                const idx = imageIndex.get(url);
+                if (idx !== undefined) return { index: idx, data: currentDisplayImages[idx] };
+                const foundIdx = currentDisplayImages.findIndex(item => item.url === url);
+                if (foundIdx !== -1) return { index: foundIdx, data: currentDisplayImages[foundIdx] };
+                return null;
+            }
+
             function updateDisplay() {
                 let filtered = getFilteredImages();
                 // 排序
@@ -1225,18 +1288,8 @@
                 });
 
                 currentDisplayImages = filtered;
-                statImages.textContent = filtered.length;
-                
-                // 优化统计计算：避免重复创建 Set，使用更高效的计算方式
-                const folderSet = new Set();
-                let totalSize = 0;
-                for (let i = 0; i < filtered.length; i++) {
-                    const img = filtered[i];
-                    folderSet.add(normalizePath(img.folder || '根目录'));
-                    totalSize += img.size || 0;
-                }
-                statFolders.textContent = folderSet.size;
-                statSize.textContent = formatSize(totalSize);
+                rebuildImageIndex();
+                updateStats(filtered);
                 
                 document.querySelectorAll('.tree-item').forEach(el => el.classList.remove('active'));
                 
@@ -1533,12 +1586,17 @@
                             closeLightbox();
                         }
                     }
-                    if(e.key==='ArrowLeft') { e.preventDefault(); navLightbox(-1); }
-                    if(e.key==='ArrowRight') { e.preventDefault(); navLightbox(1); }
-                    if(e.key==='+' || e.key==='=') { e.preventDefault(); zoomIn(); }
-                    if(e.key==='-') { e.preventDefault(); zoomOut(); }
-                    if(e.key==='0') { e.preventDefault(); resetZoom(); }
-                    if(e.key==='f' || e.key==='F') { e.preventDefault(); toggleFullscreen(); }
+                    const shortcuts = [
+                        { keys: ['ArrowLeft'], fn: () => navLightbox(-1) },
+                        { keys: ['ArrowRight'], fn: () => navLightbox(1) },
+                        { keys: ['+', '='], fn: zoomIn },
+                        { keys: ['-'], fn: zoomOut },
+                        { keys: ['0'], fn: resetZoom },
+                        { keys: [' '], fn: toggleFullscreen }
+                    ];
+                    for (const s of shortcuts) {
+                        if (s.keys.includes(e.key)) { e.preventDefault(); s.fn(); }
+                    }
                 }
             });
 
@@ -1612,17 +1670,8 @@
                         if (!scanning || generation !== scanGeneration) return;
                         const previewImages = getFilteredImages();
                         currentDisplayImages = previewImages;
-                        statImages.textContent = previewImages.length;
-
-                        const folderSet = new Set();
-                        let totalSize = 0;
-                        for (let i = 0; i < previewImages.length; i++) {
-                            const img = previewImages[i];
-                            folderSet.add(normalizePath(img.folder || '根目录'));
-                            totalSize += img.size || 0;
-                        }
-                        statFolders.textContent = folderSet.size;
-                        statSize.textContent = formatSize(totalSize);
+                        rebuildImageIndex();
+                        updateStats(previewImages);
 
                         folderTree = buildFolderTree(allImages, currentRootFolder);
                         renderTree();
