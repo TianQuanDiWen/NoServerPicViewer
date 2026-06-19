@@ -300,6 +300,7 @@
             let objectUrlSet = new Set();
             let folderSelectionInProgress = false;
             let scanGeneration = 0;
+            let isScanning = false;
 
             const CONFIG = {
                 VIEWPORT_BUFFER: 200,
@@ -729,112 +730,97 @@
                 updateSidebarToggleIcon();
             }
 
-            function buildFolderTree(images, rootFolderName = '') {
-                //  使用空路径作为根，直接使用用户选择的文件夹名称
-                const root = { name: rootFolderName || '根目录', path: '', children: {}, images: [], totalImages: 0 };
-                images.forEach(img => {
-                    const folder = normalizePath(img.folder || '');
-                    if (!folder) {
-                        root.images.push(img);
-                        root.totalImages++;
-                        return;
+
+
+            //  增量渲染：向父级 DOM 容器中插入单个文件夹节点（.tree-item + .tree-children）
+            //  parentContainer: 父容器 DOM（对于根节点是 treeContainer，对子节点是父节点的 .tree-children）
+            //  nodeData:        { name, path, totalImages }
+            //  level:           缩进层级（0 为根）
+            //  返回新建的 .tree-children 容器（供后续子目录继续增量插入）
+            function appendFolderNode(parentContainer, nodeData, level = 0) {
+                const hasChildren = nodeData.children && Object.keys(nodeData.children).length > 0;
+                const itemDiv = document.createElement('div');
+                itemDiv.className = 'tree-item';
+                itemDiv.dataset.path = nodeData.path === '' ? '__root__' : nodeData.path;
+                if (activeFolder === nodeData.path) itemDiv.classList.add('active');
+                if (level > 0) itemDiv.style.paddingLeft = (12 + level * 14) + 'px';
+
+                const toggleSpan = document.createElement('span');
+                toggleSpan.className = 'tree-toggle';
+                if (hasChildren) {
+                    toggleSpan.classList.add('expanded');
+                } else {
+                    toggleSpan.style.visibility = 'hidden';
+                }
+                toggleSpan.onclick = (e) => {
+                    e.stopPropagation();
+                    const childrenDiv = itemDiv.nextElementSibling;
+                    if (!childrenDiv || !childrenDiv.classList.contains('tree-children')) return;
+                    if (childrenDiv.style.display === 'none') {
+                        childrenDiv.style.display = 'block';
+                        toggleSpan.classList.remove('collapsed');
+                        toggleSpan.classList.add('expanded');
+                    } else {
+                        childrenDiv.style.display = 'none';
+                        toggleSpan.classList.remove('expanded');
+                        toggleSpan.classList.add('collapsed');
                     }
-                    const parts = folder.split('/');
-                    let node = root;
-                    parts.forEach((part, idx) => {
-                        const currentPath = parts.slice(0, idx+1).join('/');
-                        if (!node.children[part]) {
-                            node.children[part] = {
-                                name: part,
-                                path: currentPath,
-                                children: {},
-                                images: [],
-                                totalImages: 0
-                            };
-                        }
-                        node = node.children[part];
-                        node.totalImages++;
-                    });
-                    node.images.push(img);
-                });
-                return root;
+                };
+                itemDiv.appendChild(toggleSpan);
+
+                const icon = document.createElement('span');
+                icon.className = 'folder-icon';
+                icon.textContent = nodeData.path === '' ? '📂' : '📁';
+                itemDiv.appendChild(icon);
+
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'folder-name';
+                nameSpan.textContent = nodeData.name;
+                itemDiv.appendChild(nameSpan);
+
+                const countSpan = document.createElement('span');
+                countSpan.className = 'count';
+                countSpan.textContent = nodeData.totalImages || 0;
+                itemDiv.appendChild(countSpan);
+
+                itemDiv.onclick = (e) => {
+                    const childrenDiv = itemDiv.nextElementSibling;
+                    if (childrenDiv && childrenDiv.style.display === 'none') {
+                        childrenDiv.style.display = 'block';
+                        toggleSpan.classList.remove('collapsed');
+                        toggleSpan.classList.add('expanded');
+                    }
+                    setActiveFolder(nodeData.path);
+                };
+
+                parentContainer.appendChild(itemDiv);
+
+                const childrenDiv = document.createElement('div');
+                childrenDiv.className = 'tree-children';
+                parentContainer.appendChild(childrenDiv);
+
+                //  O(1) 引用挂载：后续 updateFolderCount 直接写 textContent，无需 querySelector
+                nodeData._countEl = countSpan;
+                nodeData._toggleEl = toggleSpan;
+                nodeData._childrenEl = childrenDiv;
+                return childrenDiv;
             }
 
+            //  首次渲染：仅创建根节点（根目录切换时调用一次，不做全量重建）
+            //  子节点由 scanDirHandle 通过 appendFolderNode 动态生长
             function renderTree() {
                 treeContainer.innerHTML = '';
                 if (!folderTree) {
                     treeContainer.innerHTML = '<div style="padding:20px;color:var(--text-secondary);">暂无文件夹</div>';
                     return;
                 }
-                function createTreeNode(node, level = 0) {
-                    const hasChildren = Object.keys(node.children).length > 0;
-                    const itemDiv = document.createElement('div');
-                    itemDiv.className = 'tree-item';
-                    //  根节点使用空字符串，其他节点使用实际路径
-                    itemDiv.dataset.path = node.path === '' ? '__root__' : node.path;
-                    if (activeFolder === node.path) itemDiv.classList.add('active');
-                    //  根节点不添加额外缩进
-                    if (level > 0) itemDiv.style.paddingLeft = (12 + level * 14) + 'px';
-                    const toggleSpan = document.createElement('span');
-                    toggleSpan.className = 'tree-toggle';
-                    if (hasChildren) {
-                        toggleSpan.classList.add('expanded');
-                        toggleSpan.onclick = (e) => {
-                            e.stopPropagation();
-                            const childrenDiv = itemDiv.nextElementSibling;
-                            if (childrenDiv && childrenDiv.classList.contains('tree-children')) {
-                                if (childrenDiv.style.display === 'none') {
-                                    childrenDiv.style.display = 'block';
-                                    toggleSpan.classList.remove('collapsed');
-                                    toggleSpan.classList.add('expanded');
-                                } else {
-                                    childrenDiv.style.display = 'none';
-                                    toggleSpan.classList.remove('expanded');
-                                    toggleSpan.classList.add('collapsed');
-                                }
-                            }
-                        };
-                    }
-                    itemDiv.appendChild(toggleSpan);
-                    const icon = document.createElement('span');
-                    icon.className = 'folder-icon';
-                    //  根节点显示为打开的文件夹图标
-                    icon.textContent = node.path === '' ? '📂' : '📁';
-                    itemDiv.appendChild(icon);
-                    const nameSpan = document.createElement('span');
-                    nameSpan.className = 'folder-name';
-                    //  直接使用节点名称（根节点为用户选择的文件夹名）
-                    nameSpan.textContent = node.name;
-                    itemDiv.appendChild(nameSpan);
-                    const countSpan = document.createElement('span');
-                    countSpan.className = 'count';
-                    countSpan.textContent = node.totalImages;
-                    itemDiv.appendChild(countSpan);
-                    itemDiv.onclick = (e) => {
-                        if (hasChildren) {
-                            const childrenDiv = itemDiv.nextElementSibling;
-                            if (childrenDiv && childrenDiv.style.display === 'none') {
-                                childrenDiv.style.display = 'block';
-                                toggleSpan.classList.remove('collapsed');
-                                toggleSpan.classList.add('expanded');
-                            }
-                        }
-                        setActiveFolder(node.path);
-                    };
-                    return itemDiv;
-                }
-                function renderChildren(container, node, level) {
-                    const itemDiv = createTreeNode(node, level);
-                    container.appendChild(itemDiv);
-                    if (Object.keys(node.children).length > 0) {
-                        const childrenDiv = document.createElement('div');
-                        childrenDiv.className = 'tree-children';
-                        Object.values(node.children).forEach(child => renderChildren(childrenDiv, child, level + 1));
-                        container.appendChild(childrenDiv);
-                    }
-                }
-                //  直接渲染根节点及其子节点，不再分离
-                renderChildren(treeContainer, folderTree, 0);
+                appendFolderNode(treeContainer, folderTree, 0);
+            }
+
+            //  更新侧边栏某个文件夹的图片计数：O(1) 直接写入 node._countEl.textContent
+            function updateFolderCount(node, count) {
+                if (!node || !node._countEl) return;
+                node._countEl.textContent = count;
             }
 
             function setActiveFolder(path) {
@@ -1327,24 +1313,26 @@
 
             function updateDisplay() {
                 let filtered = getFilteredImages();
-                // 排序
-                const [sortKey, sortOrder] = currentSort.split('-');
-                filtered.sort((a, b) => {
-                    let valA, valB;
-                    if (sortKey === 'name') {
-                        valA = a.name.toLowerCase();
-                        valB = b.name.toLowerCase();
-                    } else if (sortKey === 'date') {
-                        valA = a.modified || 0;
-                        valB = b.modified || 0;
-                    } else if (sortKey === 'size') {
-                        valA = a.size || 0;
-                        valB = b.size || 0;
-                    }
-                    if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
-                    if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
-                    return 0;
-                });
+                // 扫描期间：按扫描顺序（追加顺序）渲染，跳过 O(N log N) 排序以避免掉帧
+                if (!isScanning) {
+                    const [sortKey, sortOrder] = currentSort.split('-');
+                    filtered.sort((a, b) => {
+                        let valA, valB;
+                        if (sortKey === 'name') {
+                            valA = a.name.toLowerCase();
+                            valB = b.name.toLowerCase();
+                        } else if (sortKey === 'date') {
+                            valA = a.modified || 0;
+                            valB = b.modified || 0;
+                        } else if (sortKey === 'size') {
+                            valA = a.size || 0;
+                            valB = b.size || 0;
+                        }
+                        if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
+                        if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
+                        return 0;
+                    });
+                }
 
                 currentDisplayImages = filtered;
                 rebuildImageIndex();
@@ -1712,45 +1700,82 @@
                     cleanupAllResources();
 
                     // 先进入浏览界面，扫描过程中逐批补充图片，避免首屏被读条阻塞
+                    isScanning = true;
                     currentRootFolder = dirHandle.name;
                     allImages = [];
-                    folderTree = buildFolderTree(allImages, currentRootFolder);
+                    folderTree = { name: currentRootFolder || '根目录', path: '', children: {}, totalImages: 0 };
                     activeFolder = ''; //  默认选中根目录（空字符串）
                     searchInput.value = '';
                     scrollContainer.scrollTop = 0;
-                    renderTree();
+                    renderTree(); //  仅渲染根节点，子节点由 scanDirHandle 增量生长
                     updateDisplay();
 
                     let scannedCount = 0;
                     let renderScheduled = false;
                     let scanning = true;
 
-                    function renderScanPreview() {
-                        if (!scanning || generation !== scanGeneration) return;
-                        const previewImages = getFilteredImages();
-                        currentDisplayImages = previewImages;
-                        rebuildImageIndex();
-                        updateStats(previewImages);
-
-                        folderTree = buildFolderTree(allImages, currentRootFolder);
-                        renderTree();
-                        updateLayoutParams();
-                        renderedStartIndex = -1;
-                        renderedEndIndex = -1;
-                        renderVisibleItems();
-                        observeVisibleImages();
-                    }
-
+                    //  scheduleScanRender 仅负责主视图（图片网格）和统计信息刷新，
+                    //  侧边栏树结构由 scanDirHandle 的增量逻辑独立驱动。
                     function scheduleScanRender() {
                         if (generation !== scanGeneration) return;
                         if (renderScheduled) return;
                         renderScheduled = true;
                         requestAnimationFrame(() => {
+                            if (generation !== scanGeneration) return;
                             renderScheduled = false;
-                            renderScanPreview();
+                            const previewImages = getFilteredImages();
+                            currentDisplayImages = previewImages;
+                            rebuildImageIndex();
+                            updateStats(previewImages);
+                            updateLayoutParams();
+                            renderedStartIndex = -1;
+                            renderedEndIndex = -1;
+                            renderVisibleItems();
+                            observeVisibleImages();
                         });
                     }
-                    
+
+                    //  当目录首次被发现时，把它作为节点加入侧边栏（若尚未存在）
+                    function revealFolderInSidebar(folderPath) {
+                        if (!folderTree) return;
+                        if (folderPath === '') return;
+                        const parts = folderPath.split('/');
+                        let parentNode = folderTree;
+                        for (let i = 0; i < parts.length; i++) {
+                            const part = parts[i];
+                            const currentPath = parts.slice(0, i + 1).join('/');
+                            const level = i + 1;
+                            if (!parentNode.children[part]) {
+                                parentNode.children[part] = {
+                                    name: part,
+                                    path: currentPath,
+                                    children: {},
+                                    totalImages: 0
+                                };
+                            }
+                            const child = parentNode.children[part];
+                            if (!child._childrenEl) {
+                                const parentChildrenEl = parentNode._childrenEl;
+                                appendFolderNode(parentChildrenEl, child, level);
+                                if (parentNode._toggleEl) {
+                                    parentNode._toggleEl.style.visibility = '';
+                                    const pe = parentNode._childrenEl;
+                                    const tg = parentNode._toggleEl;
+                                    if (pe && pe.style.display === 'none') {
+                                        tg.classList.remove('expanded');
+                                        tg.classList.add('collapsed');
+                                    } else {
+                                        tg.classList.remove('collapsed');
+                                        tg.classList.add('expanded');
+                                    }
+                                }
+                            }
+                            parentNode = child;
+                        }
+                    }
+
+                    //  递归扫描：遇到子目录则 revealFolderInSidebar 增量生长；
+                    //  遇到图片则 allImages 入队，并通过 data-path 定位到侧边栏节点仅更新 .count。
                     async function scanDirHandle(handle, pathPrefix = '') {
                         if (generation !== scanGeneration) return;
                         const currentPath = normalizePath(pathPrefix);
@@ -1762,26 +1787,52 @@
                                     const file = await entry.getFile();
                                     if (generation !== scanGeneration) return;
                                     const url = URL.createObjectURL(file);
-                                    // 将创建的 URL 加入跟踪集合
                                     objectUrlSet.add(url);
-                                    allImages.push({
+                                    const imgData = {
                                         url: url,
                                         name: entry.name,
                                         folder: currentPath,
                                         size: file.size,
                                         modified: file.lastModified
-                                    });
+                                    };
+                                    allImages.push(imgData);
+
+                                    //  更新内存树（O(1) 直接写入 _countEl，零 DOM 查询）
+                                    //  revealFolderInSidebar 已保证路径上所有内存节点必然存在
+                                    folderTree.totalImages++;
+                                    updateFolderCount(folderTree, folderTree.totalImages);
+                                    if (currentPath) {
+                                        const parts = currentPath.split('/');
+                                        let node = folderTree;
+                                        let syncFailed = false;
+                                        for (let i = 0; i < parts.length; i++) {
+                                            const part = parts[i];
+                                            if (!node.children[part]) {
+                                                //  内存树与文件系统不同步：仅警告并跳出当前路径追溯，绝不中断整个扫描
+                                                console.warn('Memory tree out of sync:', currentPath);
+                                                syncFailed = true;
+                                                break;
+                                            }
+                                            node = node.children[part];
+                                            node.totalImages++;
+                                            updateFolderCount(node, node.totalImages);
+                                        }
+                                        // syncFailed=true 时该图片不写入当前节点（仅影响该层级计数），
+                                        // allImages 全局数组已在前面 push，主视图渲染不受影响
+                                    }
+                                    // images.push(imgData) 已移除：allImages 是唯一数据源，
+                                    // 内存树节点仅负责 DOM 结构映射与 O(1) 计数更新
+
                                     scannedCount++;
-                                    
-                                    // 每扫描100个文件刷新一次界面，并让出主线程避免界面冻结
                                     if (scannedCount === 1 || scannedCount % 100 === 0) {
                                         scheduleScanRender();
-                                        // 让出主线程，避免界面冻结
                                         await new Promise(resolve => setTimeout(resolve, 0));
                                     }
                                 }
                             } else if (entry.kind === 'directory') {
                                 const childPath = currentPath ? currentPath + '/' + entry.name : entry.name;
+                                //  发现子目录时，立即在侧边栏对应位置增量插入节点（实现动态生长）
+                                revealFolderInSidebar(childPath);
                                 await scanDirHandle(entry, childPath);
                             }
                         }
@@ -1790,8 +1841,8 @@
                     if (generation !== scanGeneration) return;
 
                     scanning = false;
-                    folderTree = buildFolderTree(allImages, currentRootFolder);
-                    renderTree();
+                    isScanning = false;
+                    //  扫描结束后执行一次完整的 updateDisplay：触发最终排序与视图刷新
                     updateDisplay();
                     showToast(`✅ 已加载 ${allImages.length} 张图片`);
                 } catch (err) {
