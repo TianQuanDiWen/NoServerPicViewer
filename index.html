@@ -410,6 +410,28 @@
                 objectUrlSet.clear();
             }
 
+            function revokeObjectUrl(url) {
+                try {
+                    if (url) URL.revokeObjectURL(url);
+                } catch (e) {
+                    console.warn('Failed to revoke URL:', e);
+                }
+            }
+
+            async function ensureImageObjectUrl(imgData) {
+                if (imgData.url && imgData.url.startsWith('blob:')) return imgData.url;
+                if (!imgData.handle) throw new Error('图片文件句柄不可用');
+                const file = await imgData.handle.getFile();
+                const url = URL.createObjectURL(file);
+                imgData.url = url;
+                objectUrlSet.add(url);
+                return url;
+            }
+
+            function getImageId(imgData) {
+                return imgData.id || imgData.url;
+            }
+
             // 工作线程池配置
             let activeWorkers = 0;
             const MAX_CONCURRENT_WORKERS = 3;
@@ -541,7 +563,7 @@
             }
 
             function resetFailedImagesInCurrentDisplay() {
-                const currentIds = new Set(currentDisplayImages.map(img => img.url));
+                const currentIds = new Set(currentDisplayImages.map(getImageId));
                 visibleContent.querySelectorAll('img.error[data-src]').forEach(img => {
                     if (!currentIds.has(img.dataset.src)) return;
                     img.classList.remove('error');
@@ -578,8 +600,8 @@
                 }
             }
 
-            // 全局资源清理函数
-            function cleanupAllResources() {
+            // 资源清理函数。切换文件夹时保留布局监听；页面卸载时才断开。
+            function cleanupAllResources({ cleanupLayoutListeners = false } = {}) {
                 // 清理分批加载定时器
                 clearImageLoadQueue();
                 
@@ -610,8 +632,8 @@
                 // 清理缩略图缓存
                 thumbnailCache.clear();
                 
-                // 断开 ResizeObserver
-                if (resizeObserver) {
+                // 页面卸载时断开 ResizeObserver；切换文件夹时保留，避免后续布局不再响应尺寸变化。
+                if (cleanupLayoutListeners && resizeObserver) {
                     resizeObserver.disconnect();
                     resizeObserver = null;
                 }
@@ -913,7 +935,7 @@
                 
                 for (let i = startIndex; i < endIndex; i++) {
                     const img = currentDisplayImages[i];
-                    const imageId = img.url;
+                    const imageId = getImageId(img);
                     newVisibleIds.add(imageId);
                     
                     let card = existingMap.get(imageId);
@@ -957,14 +979,14 @@
             function createCardElement(img, globalIndex) {
                 const card = document.createElement('div');
                 card.className = 'image-card';
-                card.dataset.imageId = img.url;
+                card.dataset.imageId = getImageId(img);
                 card.dataset.index = globalIndex;
                 
                 const imgContainer = document.createElement('div');
                 imgContainer.className = 'img-container';
                 
                 const imageEl = document.createElement('img');
-                imageEl.dataset.src = img.url;
+                imageEl.dataset.src = getImageId(img);
                 imageEl.alt = img.name;
                 imageEl.setAttribute('decoding', 'async');
                 imageEl.style.width = '100%';
@@ -1051,10 +1073,13 @@
                 largeImagesToProcess.forEach(({ element, data }) => {
                     markImageScheduled(element, 'large');
                     
-                    scheduleWorkerTask(() => atomicThumbnailTask(data.url))
+                    scheduleWorkerTask(async () => atomicThumbnailTask(await ensureImageObjectUrl(data)))
                         .then(thumbnailUrl => {
-                            if (generation !== loadGeneration) return;
-                            thumbnailCache.set(data.url, thumbnailUrl);
+                            if (generation !== loadGeneration) {
+                                revokeObjectUrl(thumbnailUrl);
+                                return;
+                            }
+                            thumbnailCache.set(getImageId(data), thumbnailUrl);
                             if (!element.isConnected) return;
                             
                             log('debug', '[THUMB] Generated, now loading:', data.name);
@@ -1130,7 +1155,7 @@
                 while (attempt <= maxRetries) {
                     attempt++;
                     try {
-                        let imageUrl = imgData.url;
+                        let imageUrl = await ensureImageObjectUrl(imgData);
                         
                         if (!imageUrl || !imageUrl.startsWith('blob:')) {
                             log('warn', '[ERROR] Invalid Object URL:', imgData.name);
@@ -1139,16 +1164,19 @@
                         }
                         
                         if (isLargeImage) {
-                            const cachedThumbnail = thumbnailCache.get(imgData.url);
+                            const cachedThumbnail = thumbnailCache.get(getImageId(imgData));
                             if (cachedThumbnail) {
                                 imageUrl = cachedThumbnail;
                             } else {
                                 try {
                                     const thumbnailUrl = await scheduleWorkerTask(() => 
-                                        atomicThumbnailTask(imgData.url)
+                                        atomicThumbnailTask(imageUrl)
                                     );
-                                    if (generation !== loadGeneration) return;
-                                    thumbnailCache.set(imgData.url, thumbnailUrl);
+                                    if (generation !== loadGeneration) {
+                                        revokeObjectUrl(thumbnailUrl);
+                                        return;
+                                    }
+                                    thumbnailCache.set(getImageId(imgData), thumbnailUrl);
                                     imageUrl = thumbnailUrl;
                                 } catch (thumbErr) {
                                     log('warn', '[THUMB] Failed, falling back to original:', imgData.name);
@@ -1299,14 +1327,14 @@
             function rebuildImageIndex() {
                 imageIndex.clear();
                 for (let i = 0; i < currentDisplayImages.length; i++) {
-                    imageIndex.set(currentDisplayImages[i].url, i);
+                    imageIndex.set(getImageId(currentDisplayImages[i]), i);
                 }
             }
 
-            function findImageByUrl(url) {
-                const idx = imageIndex.get(url);
+            function findImageByUrl(imageId) {
+                const idx = imageIndex.get(imageId);
                 if (idx !== undefined) return { index: idx, data: currentDisplayImages[idx] };
-                const foundIdx = currentDisplayImages.findIndex(item => item.url === url);
+                const foundIdx = currentDisplayImages.findIndex(item => getImageId(item) === imageId);
                 if (foundIdx !== -1) return { index: foundIdx, data: currentDisplayImages[foundIdx] };
                 return null;
             }
@@ -1399,16 +1427,21 @@
             let currentLightboxList = [];
             let currentIndex = -1;
 
-            function openLightbox(idx, list){
+            async function openLightbox(idx, list){
                 if(!list.length) return;
                 currentLightboxList = list;
                 currentIndex = idx;
                 const img = list[idx];
-                lightboxImg.src = img.url;
                 lightbox.style.display = 'flex';
                 lightboxPrev.style.display = list.length>1?'flex':'none';
                 lightboxNext.style.display = list.length>1?'flex':'none';
                 resetZoom();
+                try {
+                    lightboxImg.src = await ensureImageObjectUrl(img);
+                } catch (err) {
+                    showToast('❌ 无法打开图片：' + err.message);
+                    closeLightbox();
+                }
             }
 
             function closeLightbox(){ 
@@ -1581,7 +1614,7 @@
                 if (currentLightboxList.length === 0) return;
                 const img = currentLightboxList[currentIndex];
                 try {
-                    const response = await fetch(img.url);
+                    const response = await fetch(await ensureImageObjectUrl(img));
                     const blob = await response.blob();
                     await navigator.clipboard.write([
                         new ClipboardItem({ [blob.type]: blob })
@@ -1786,10 +1819,10 @@
                                 if (imageExtensions.has(ext)) {
                                     const file = await entry.getFile();
                                     if (generation !== scanGeneration) return;
-                                    const url = URL.createObjectURL(file);
-                                    objectUrlSet.add(url);
                                     const imgData = {
-                                        url: url,
+                                        id: (currentPath ? currentPath + '/' : '') + entry.name + ':' + file.size + ':' + file.lastModified,
+                                        url: null,
+                                        handle: entry,
                                         name: entry.name,
                                         folder: currentPath,
                                         size: file.size,
@@ -1958,7 +1991,7 @@
             // 页面卸载时清理所有资源，防止内存泄漏
             window.addEventListener('beforeunload', () => {
                 cleanupResizeListener();
-                cleanupAllResources();
+                cleanupAllResources({ cleanupLayoutListeners: true });
             });
         })();
     </script>
