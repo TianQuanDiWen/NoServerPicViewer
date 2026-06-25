@@ -86,14 +86,13 @@
         .image-card {
             background:var(--card-bg); border-radius:12px; overflow:hidden;
             border:1px solid var(--border); box-shadow:var(--shadow); cursor:pointer;
-            transition:box-shadow 0.2s; display:flex; flex-direction:column;
-            position:absolute; top:0; left:0;
+            transition:transform 0.2s, box-shadow 0.2s; display:flex; flex-direction:column;
+            position:absolute;
         }
-        .image-card:hover { box-shadow:var(--shadow-hover); }
-        .image-card:hover .img-container { transform:translateY(-3px); }
+        .image-card:hover { transform:translateY(-3px); box-shadow:var(--shadow-hover); }
         .img-container {
             width:100%; aspect-ratio:4/3; background:#e0e0e5;
-            position:relative; overflow:hidden; transition:transform 0.2s;
+            position:relative; overflow:hidden;
         }
         .img-container img {
             width:100%; height:100%; object-fit:cover; display:block;
@@ -167,6 +166,7 @@
 
         @media (max-width: 768px) {
             .sidebar { position: fixed; left:0; top:0; height:100%; transform: translateX(-100%); z-index: 200; }
+            .sidebar.collapsed { width: var(--sidebar-width); min-width: var(--sidebar-width); margin-left: 0; border-right: 1px solid var(--border); }
             .sidebar.open { transform: translateX(0); box-shadow: 4px 0 20px rgba(0,0,0,0.3); }
             .sidebar-toggle { display: inline-flex !important; }
             .main-area { width: 100%; }
@@ -187,6 +187,7 @@
             <button class="btn sidebar-toggle" id="sidebarToggleBtn" onclick="toggleSidebar()" aria-label="切换侧边栏">☰</button>
             <span class="logo">🖼️ 图片浏览器</span>
             <button class="btn primary" id="selectFolderBtn">📂 选择本地文件夹</button>
+            <button class="btn" id="syncFolderBtn" style="display:none;">🔄 同步</button>
             <div class="search-wrapper">
                 <span class="search-icon">🔍</span>
                 <input type="text" id="searchInput" placeholder="搜索图片名称...">
@@ -262,17 +263,55 @@
             const filterDateEnd = document.getElementById('filterDateEnd');
             const applyFilterBtn = document.getElementById('applyFilterBtn');
             const clearFilterBtn = document.getElementById('clearFilterBtn');
+            const syncFolderBtn = document.getElementById('syncFolderBtn');
+
+            const idb = {
+                _dbPromise: null,
+                open() {
+                    if (this._dbPromise) return this._dbPromise;
+                    this._dbPromise = new Promise((resolve, reject) => {
+                        const request = indexedDB.open('settingsDB', 1);
+                        request.onupgradeneeded = () => {
+                            const db = request.result;
+                            if (!db.objectStoreNames.contains('config')) {
+                                db.createObjectStore('config');
+                            }
+                        };
+                        request.onsuccess = () => resolve(request.result);
+                        request.onerror = () => reject(request.error);
+                    });
+                    return this._dbPromise;
+                },
+                async get(key) {
+                    const db = await this.open();
+                    return new Promise((resolve, reject) => {
+                        const tx = db.transaction('config', 'readonly');
+                        const request = tx.objectStore('config').get(key);
+                        request.onsuccess = () => resolve(request.result);
+                        request.onerror = () => reject(request.error);
+                    });
+                },
+                async set(key, value) {
+                    const db = await this.open();
+                    return new Promise((resolve, reject) => {
+                        const tx = db.transaction('config', 'readwrite');
+                        const request = tx.objectStore('config').put(value, key);
+                        request.onsuccess = () => resolve();
+                        request.onerror = () => reject(request.error);
+                    });
+                }
+            };
 
             let allImages = [];
-            let imageIndex = new Map();
             let folderTree = null;
             let activeFolder = null;
             let currentRootFolder = ''; //  存储用户选择的根文件夹名称
             let currentDisplayImages = [];
+            let imageIndex = new Map();
+            let displayRevision = 0;
             const imageExtensions = new Set(['jpg','jpeg','png','gif','webp','bmp','svg','tiff','tif','avif','ico','heic','heif','jfif']);
             
             let rowHeight = 260;
-            let measuredRowHeight = null;
             let columnCount = 4;
             let containerWidth = 0;
             let gap = 12;
@@ -301,6 +340,9 @@
             let folderSelectionInProgress = false;
             let scanGeneration = 0;
             let isScanning = false;
+            let currentRootDirHandle = null;
+            let folderHandleMap = new Map();
+            let saveUISettingsTimer = null;
 
             const CONFIG = {
                 VIEWPORT_BUFFER: 200,
@@ -398,7 +440,7 @@
                 return bytes.toFixed(i?1:0)+' '+u[i];
             }
             
-            // 统一的 Object URL 清理函数
+            // 只 revoke 已跟踪 URL；img.src 由加载生命周期单独处理
             function cleanupObjectUrls() {
                 objectUrlSet.forEach(url => {
                     try {
@@ -408,28 +450,9 @@
                     }
                 });
                 objectUrlSet.clear();
-            }
-
-            function revokeObjectUrl(url) {
-                try {
-                    if (url) URL.revokeObjectURL(url);
-                } catch (e) {
-                    console.warn('Failed to revoke URL:', e);
-                }
-            }
-
-            async function ensureImageObjectUrl(imgData) {
-                if (imgData.url && imgData.url.startsWith('blob:')) return imgData.url;
-                if (!imgData.handle) throw new Error('图片文件句柄不可用');
-                const file = await imgData.handle.getFile();
-                const url = URL.createObjectURL(file);
-                imgData.url = url;
-                objectUrlSet.add(url);
-                return url;
-            }
-
-            function getImageId(imgData) {
-                return imgData.id || imgData.url;
+                allImages.forEach(img => {
+                    if (img.url && img.url.startsWith('blob:')) img.url = null;
+                });
             }
 
             // 工作线程池配置
@@ -510,6 +533,13 @@
                 });
             }
 
+            function clearWorkerQueue(reason = 'cancelled') {
+                const pending = workerQueue.splice(0);
+                pending.forEach(({ reject }) => {
+                    try { reject(new Error(reason)); } catch (e) {}
+                });
+            }
+
             function clearImageLoadQueue() {
                 loadGeneration++;
                 if (loadingBatchTimer) {
@@ -521,7 +551,7 @@
                     releaseScheduledBatch(batch);
                 });
                 loadingBatchTimers = [];
-                workerQueue = [];
+                clearWorkerQueue('image load queue cleared');
                 visibleContent.querySelectorAll('img[data-scheduled]').forEach(img => {
                     resetImageLoadState(img, true);
                 });
@@ -600,45 +630,32 @@
                 }
             }
 
-            // 资源清理函数。切换文件夹时保留布局监听；页面卸载时才断开。
             function cleanupAllResources({ cleanupLayoutListeners = false } = {}) {
-                // 清理分批加载定时器
                 clearImageLoadQueue();
-                
-                // 清理滚动相关定时器
+
                 if (scrollPauseTimer) {
                     clearTimeout(scrollPauseTimer);
                     scrollPauseTimer = null;
                 }
-                
-                //  清理搜索防抖定时器
+
                 if (searchDebounceTimer) {
                     clearTimeout(searchDebounceTimer);
                     searchDebounceTimer = null;
                 }
-                
-                //  清理 resize 防抖定时器
+
                 if (resizeDebounceTimer) {
                     clearTimeout(resizeDebounceTimer);
                     resizeDebounceTimer = null;
                 }
-                
-                // 重置滚动状态
+
                 isScrolling = false;
-                
-                // 清理所有 Object URL
                 cleanupObjectUrls();
-                
-                // 清理缩略图缓存
                 thumbnailCache.clear();
-                
-                // 页面卸载时断开 ResizeObserver；切换文件夹时保留，避免后续布局不再响应尺寸变化。
+
                 if (cleanupLayoutListeners && resizeObserver) {
                     resizeObserver.disconnect();
                     resizeObserver = null;
                 }
-                
-                console.log('All resources cleaned up');
             }
             
             // 动态批次大小计算（指数衰减策略）
@@ -651,21 +668,13 @@
                 const d=new Date(ms);
                 return d.getFullYear()+'-'+(d.getMonth()+1).toString().padStart(2,'0')+'-'+d.getDate().toString().padStart(2,'0');
             }
-            // 高效的 HTML 转义（避免每次创建 DOM 元素）
-            function escapeHtml(s) {
-                if (s === null || s === undefined) return '';
-                return String(s)
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;')
-                    .replace(/"/g, '&quot;')
-                    .replace(/'/g, '&#39;');
-            }
+            function escapeHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
             
             function isInViewport(imgElement) {
                 if (!imgElement.isConnected) return false;
                 const rect = imgElement.getBoundingClientRect();
                 const viewHeight = window.innerHeight || document.documentElement.clientHeight;
+                // 判断图片是否与扩展后的视口相交
                 return rect.bottom >= -CONFIG.VIEWPORT_BUFFER && rect.top <= viewHeight + CONFIG.VIEWPORT_BUFFER;
             }
 
@@ -679,7 +688,145 @@
                 return p.replace(/\\/g, '/').trim().replace(/\/+$/, '');
             }
 
-            const SIDEBAR_STORAGE_KEY = 'picviewer_sidebar_collapsed';
+            function imageIdentityKey(folder, name, size, modified) {
+                return `${normalizePath(folder || '')}/${name}:${size || 0}:${modified || 0}`;
+            }
+
+            function fileLocationKey(folder, name) {
+                return `${normalizePath(folder || '')}/${name}`;
+            }
+
+            function getAncestorPaths(path) {
+                const parts = normalizePath(path || '').split('/').filter(Boolean);
+                const result = [''];
+                for (let i = 0; i < parts.length; i++) {
+                    result.push(parts.slice(0, i + 1).join('/'));
+                }
+                return result;
+            }
+
+            async function resolveDirectoryHandleByPath(rootHandle, path) {
+                const normalized = normalizePath(path || '');
+                if (!normalized) return rootHandle;
+
+                let handle = rootHandle;
+                let currentPath = '';
+                for (const part of normalized.split('/')) {
+                    handle = await handle.getDirectoryHandle(part);
+                    currentPath = currentPath ? `${currentPath}/${part}` : part;
+                    folderHandleMap.set(currentPath, handle);
+                }
+                return handle;
+            }
+
+            function getImageId(img) {
+                if (!img.id) {
+                    img.id = imageIdentityKey(img.folder, img.name, img.size, img.modified);
+                }
+                return img.id;
+            }
+
+            function rebuildImageIndex() {
+                imageIndex.clear();
+                for (const img of currentDisplayImages) {
+                    imageIndex.set(getImageId(img), img);
+                }
+            }
+
+            async function ensureImageObjectUrl(imgData) {
+                if (imgData.url && imgData.url.startsWith('blob:')) return imgData.url;
+                if (!imgData.handle) return imgData.url || '';
+                const file = await imgData.handle.getFile();
+                const url = URL.createObjectURL(file);
+                objectUrlSet.add(url);
+                imgData.url = url;
+                return url;
+            }
+
+            function revokeObjectUrl(imgData) {
+                if (!imgData || !imgData.url) return;
+                try { URL.revokeObjectURL(imgData.url); } catch (e) {}
+                objectUrlSet.delete(imgData.url);
+                thumbnailCache.delete(getImageId(imgData));
+                imgData.url = null;
+            }
+
+            function updateSyncButtonVisibility() {
+                syncFolderBtn.style.display = currentRootDirHandle ? 'inline-flex' : 'none';
+            }
+
+            function getExpandedFolderPaths() {
+                const paths = [];
+                treeContainer.querySelectorAll('.tree-children').forEach(children => {
+                    if (children.style.display === 'none') return;
+                    const item = children.previousElementSibling;
+                    if (!item || !item.classList.contains('tree-item')) return;
+                    paths.push(item.dataset.path === '__root__' ? '' : normalizePath(item.dataset.path || ''));
+                });
+                return paths;
+            }
+
+            function scheduleSaveUISettings() {
+                clearTimeout(saveUISettingsTimer);
+                saveUISettingsTimer = setTimeout(async () => {
+                    const sidebar = document.getElementById('sidebar');
+                    const uiState = {
+                        activeFolder,
+                        expandedFolders: getExpandedFolderPaths(),
+                        sidebarCollapsedDesktop: sidebar.classList.contains('collapsed'),
+                        currentSort
+                    };
+                    try {
+                        await idb.set('uiState', uiState);
+                    } catch (err) {
+                        log('warn', 'Failed to save UI settings', err);
+                    }
+                }, 300);
+            }
+
+            function getFolderNode(path) {
+                if (!folderTree) return null;
+                const normalized = normalizePath(path || '');
+                if (!normalized) return folderTree;
+                return normalized.split('/').reduce((node, part) => node && node.children[part], folderTree);
+            }
+
+            function createFolderNode(name, path, handle = null) {
+                return {
+                    name,
+                    path,
+                    children: {},
+                    totalImages: 0,
+                    _handle: handle,
+                    _countEl: null,
+                    _toggleEl: null,
+                    _childrenEl: null
+                };
+            }
+
+            function ensureFolderDataNode(root, path, handle = null) {
+                const normalized = normalizePath(path || '');
+                if (!normalized) {
+                    if (handle) root._handle = handle;
+                    return root;
+                }
+                let node = root;
+                const parts = normalized.split('/');
+                parts.forEach((part, idx) => {
+                    const currentPath = parts.slice(0, idx + 1).join('/');
+                    if (!node.children[part]) {
+                        node.children[part] = createFolderNode(
+                            part,
+                            currentPath,
+                            folderHandleMap.get(currentPath) || null
+                        );
+                    }
+                    node = node.children[part];
+                    if (!node._handle) node._handle = folderHandleMap.get(currentPath) || null;
+                });
+                if (handle) node._handle = handle;
+                return node;
+            }
 
             function isMobileLayout() {
                 return window.innerWidth <= 768;
@@ -700,30 +847,21 @@
                 const sidebar = document.getElementById('sidebar');
                 const overlay = document.getElementById('sidebarOverlay');
                 if (isMobileLayout()) {
-                    // 移动端：open 类 + 遮罩
-                    if (sidebar.classList.contains('open')) {
-                        sidebar.classList.remove('open');
-                        overlay.style.display = 'none';
-                    } else {
-                        sidebar.classList.add('open');
-                        overlay.style.display = 'block';
-                    }
+                    const shouldOpen = !sidebar.classList.contains('open');
+                    sidebar.classList.toggle('open', shouldOpen);
+                    overlay.style.display = shouldOpen ? 'block' : 'none';
                 } else {
-                    // 桌面端：collapsed 类切换 + localStorage 记忆 + 无遮罩
-                    const willCollapse = !sidebar.classList.contains('collapsed');
                     sidebar.classList.toggle('collapsed');
                     overlay.style.display = 'none';
-                    try { localStorage.setItem(SIDEBAR_STORAGE_KEY, willCollapse ? '1' : '0'); } catch(e) {}
-
-                    // 侧边栏过渡结束后立即刷新布局 — 不经过 ResizeObserver 的 150ms debounce，
-                    // 消除折叠/展开后"顿一下"的视觉体验。ResizeObserver 仍然保留用于窗口/DPR 缩放。
-                    const onSidebarTransitionEnd = function(e) {
-                        if (e.propertyName !== 'margin-left') return; // 只响应 margin-left 结束（忽略 transform）
+                    const onSidebarTransitionEnd = event => {
+                        if (event.propertyName !== 'margin-left') return;
                         requestLayoutRefresh();
                     };
                     sidebar.addEventListener('transitionend', onSidebarTransitionEnd, { once: true });
+                    setTimeout(requestLayoutRefresh, 350);
                 }
                 updateSidebarToggleIcon();
+                scheduleSaveUISettings();
             };
 
             function requestLayoutRefresh() {
@@ -734,115 +872,158 @@
                 observeVisibleImages();
             }
 
-            function applySavedSidebarState() {
-                const sidebar = document.getElementById('sidebar');
-                const overlay = document.getElementById('sidebarOverlay');
-                if (isMobileLayout()) {
-                    sidebar.classList.remove('collapsed');
-                    sidebar.classList.remove('open');
-                    overlay.style.display = 'none';
-                } else {
-                    let collapsed = false;
-                    try { collapsed = localStorage.getItem(SIDEBAR_STORAGE_KEY) === '1'; } catch(e) {}
-                    if (collapsed) sidebar.classList.add('collapsed');
-                    else sidebar.classList.remove('collapsed');
-                    sidebar.classList.remove('open');
-                    overlay.style.display = 'none';
-                }
-                updateSidebarToggleIcon();
+            function buildFolderTree(images, rootFolderName = '') {
+                const root = createFolderNode(rootFolderName || '根目录', '', currentRootDirHandle);
+                images.forEach(img => {
+                    const folder = normalizePath(img.folder || '');
+                    root.totalImages++;
+                    const node = ensureFolderDataNode(root, folder);
+                    if (node !== root) node.totalImages++;
+                    if (folder) {
+                        const parts = folder.split('/');
+                        let parent = root;
+                        for (let i = 0; i < parts.length - 1; i++) {
+                            parent = parent.children[parts[i]];
+                            parent.totalImages++;
+                        }
+                    }
+                });
+                return root;
             }
 
+            function setTreeNodeExpanded(node, expanded) {
+                if (!node._childrenEl || !node._toggleEl) return;
+                node._childrenEl.style.display = expanded ? 'block' : 'none';
+                node._toggleEl.classList.toggle('expanded', expanded);
+                node._toggleEl.classList.toggle('collapsed', !expanded);
+            }
 
-
-            //  增量渲染：向父级 DOM 容器中插入单个文件夹节点（.tree-item + .tree-children）
-            //  parentContainer: 父容器 DOM（对于根节点是 treeContainer，对子节点是父节点的 .tree-children）
-            //  nodeData:        { name, path, totalImages }
-            //  level:           缩进层级（0 为根）
-            //  返回新建的 .tree-children 容器（供后续子目录继续增量插入）
-            function appendFolderNode(parentContainer, nodeData, level = 0) {
-                const hasChildren = nodeData.children && Object.keys(nodeData.children).length > 0;
+            function createTreeItemElement(node, level) {
                 const itemDiv = document.createElement('div');
                 itemDiv.className = 'tree-item';
-                itemDiv.dataset.path = nodeData.path === '' ? '__root__' : nodeData.path;
-                if (activeFolder === nodeData.path) itemDiv.classList.add('active');
+                itemDiv.dataset.path = node.path === '' ? '__root__' : node.path;
+                if (activeFolder === node.path) itemDiv.classList.add('active');
                 if (level > 0) itemDiv.style.paddingLeft = (12 + level * 14) + 'px';
 
                 const toggleSpan = document.createElement('span');
                 toggleSpan.className = 'tree-toggle';
-                if (hasChildren) {
-                    toggleSpan.classList.add('expanded');
-                } else {
-                    toggleSpan.style.visibility = 'hidden';
-                }
-                toggleSpan.onclick = (e) => {
-                    e.stopPropagation();
-                    const childrenDiv = itemDiv.nextElementSibling;
-                    if (!childrenDiv || !childrenDiv.classList.contains('tree-children')) return;
-                    if (childrenDiv.style.display === 'none') {
-                        childrenDiv.style.display = 'block';
-                        toggleSpan.classList.remove('collapsed');
-                        toggleSpan.classList.add('expanded');
-                    } else {
-                        childrenDiv.style.display = 'none';
-                        toggleSpan.classList.remove('expanded');
-                        toggleSpan.classList.add('collapsed');
-                    }
-                };
                 itemDiv.appendChild(toggleSpan);
 
                 const icon = document.createElement('span');
                 icon.className = 'folder-icon';
-                icon.textContent = nodeData.path === '' ? '📂' : '📁';
+                icon.textContent = node.path === '' ? '📂' : '📁';
                 itemDiv.appendChild(icon);
 
                 const nameSpan = document.createElement('span');
                 nameSpan.className = 'folder-name';
-                nameSpan.textContent = nodeData.name;
+                nameSpan.textContent = node.name;
                 itemDiv.appendChild(nameSpan);
 
                 const countSpan = document.createElement('span');
                 countSpan.className = 'count';
-                countSpan.textContent = nodeData.totalImages || 0;
+                countSpan.textContent = node.totalImages;
                 itemDiv.appendChild(countSpan);
 
-                itemDiv.onclick = (e) => {
-                    const childrenDiv = itemDiv.nextElementSibling;
-                    if (childrenDiv && childrenDiv.style.display === 'none') {
-                        childrenDiv.style.display = 'block';
-                        toggleSpan.classList.remove('collapsed');
-                        toggleSpan.classList.add('expanded');
-                    }
-                    setActiveFolder(nodeData.path);
-                };
-
-                parentContainer.appendChild(itemDiv);
-
-                const childrenDiv = document.createElement('div');
-                childrenDiv.className = 'tree-children';
-                parentContainer.appendChild(childrenDiv);
-
-                //  O(1) 引用挂载：后续 updateFolderCount 直接写 textContent，无需 querySelector
-                nodeData._countEl = countSpan;
-                nodeData._toggleEl = toggleSpan;
-                nodeData._childrenEl = childrenDiv;
-                return childrenDiv;
+                node._toggleEl = toggleSpan;
+                node._countEl = countSpan;
+                return { itemDiv, toggleSpan, countSpan };
             }
 
-            //  首次渲染：仅创建根节点（根目录切换时调用一次，不做全量重建）
-            //  子节点由 scanDirHandle 通过 appendFolderNode 动态生长
-            function renderTree() {
+            function bindTreeItemEvents(itemDiv, toggleSpan, node) {
+                toggleSpan.onclick = (event) => {
+                    event.stopPropagation();
+                    if (!node._childrenEl) return;
+                    setTreeNodeExpanded(node, node._childrenEl.style.display === 'none');
+                    scheduleSaveUISettings();
+                };
+
+                itemDiv.onclick = () => {
+                    if (node._childrenEl && node._childrenEl.style.display === 'none') {
+                        setTreeNodeExpanded(node, true);
+                        scheduleSaveUISettings();
+                    }
+                    setActiveFolder(node.path);
+                };
+            }
+
+            function ensureFolderDomNode(parentNode, node, expandedPathSet) {
+                if (node._toggleEl && node._toggleEl.isConnected) return;
+                const shouldExpand = parentNode._childrenEl
+                    ? parentNode._childrenEl.style.display !== 'none'
+                    : expandedPathSet.has(parentNode.path);
+                if (!parentNode._childrenEl) {
+                    const childrenDiv = document.createElement('div');
+                    childrenDiv.className = 'tree-children';
+                    childrenDiv.style.display = shouldExpand ? 'block' : 'none';
+                    parentNode._childrenEl = childrenDiv;
+                    const parentItem = parentNode._toggleEl && parentNode._toggleEl.parentElement;
+                    if (parentItem) parentItem.insertAdjacentElement('afterend', childrenDiv);
+                }
+                setTreeNodeExpanded(parentNode, shouldExpand);
+
+                const level = node.path ? node.path.split('/').length : 0;
+                const { itemDiv, toggleSpan } = createTreeItemElement(node, level);
+                bindTreeItemEvents(itemDiv, toggleSpan, node);
+                parentNode._childrenEl.appendChild(itemDiv);
+            }
+
+            function renderTree(expandedPaths = null) {
+                const expanded = expandedPaths
+                    ? new Set(expandedPaths.map(path => normalizePath(path || '')))
+                    : new Set(getExpandedFolderPaths());
                 treeContainer.innerHTML = '';
                 if (!folderTree) {
                     treeContainer.innerHTML = '<div style="padding:20px;color:var(--text-secondary);">暂无文件夹</div>';
                     return;
                 }
-                appendFolderNode(treeContainer, folderTree, 0);
+
+                function renderChildren(container, node, level) {
+                    const { itemDiv, toggleSpan } = createTreeItemElement(node, level);
+                    bindTreeItemEvents(itemDiv, toggleSpan, node);
+                    container.appendChild(itemDiv);
+                    if (Object.keys(node.children).length === 0) return;
+
+                    const childrenDiv = document.createElement('div');
+                    childrenDiv.className = 'tree-children';
+                    node._childrenEl = childrenDiv;
+                    Object.values(node.children).forEach(child => renderChildren(childrenDiv, child, level + 1));
+                    container.appendChild(childrenDiv);
+                    setTreeNodeExpanded(node, expanded.has(node.path));
+                }
+
+                renderChildren(treeContainer, folderTree, 0);
             }
 
-            //  更新侧边栏某个文件夹的图片计数：O(1) 直接写入 node._countEl.textContent
-            function updateFolderCount(node, count) {
-                if (!node || !node._countEl) return;
-                node._countEl.textContent = count;
+            function ensureIncrementalFolderNode(path, handle, expandedPathSet) {
+                if (!folderTree) return null;
+                const normalized = normalizePath(path || '');
+                if (!normalized) return ensureFolderDataNode(folderTree, '', handle);
+
+                let parentNode = folderTree;
+                const parts = normalized.split('/');
+                parts.forEach((part, index) => {
+                    const currentPath = parts.slice(0, index + 1).join('/');
+                    const node = ensureFolderDataNode(folderTree, currentPath);
+                    ensureFolderDomNode(parentNode, node, expandedPathSet);
+                    parentNode = node;
+                });
+                if (handle) parentNode._handle = handle;
+                return parentNode;
+            }
+
+            function incrementFolderCounts(folderPath, dirtyNodes) {
+                if (!folderTree) return;
+                folderTree.totalImages++;
+                dirtyNodes.add(folderTree);
+                const normalized = normalizePath(folderPath || '');
+                if (!normalized) return;
+                let node = folderTree;
+                for (const part of normalized.split('/')) {
+                    node = node.children[part];
+                    if (!node) return;
+                    node.totalImages++;
+                    dirtyNodes.add(node);
+                }
             }
 
             function setActiveFolder(path) {
@@ -859,20 +1040,39 @@
                     document.getElementById('sidebar').classList.remove('open');
                     document.getElementById('sidebarOverlay').style.display = 'none';
                 }
+                scheduleSaveUISettings();
+                if (!isScanning && normalized !== null) {
+                    const node = getFolderNode(normalized);
+                    if (node && node._handle) backgroundSync(node._handle, normalized);
+                }
             }
 
             function imageBelongsToFolder(img, folderPath) {
-                //  空字符串表示根目录（用户选择的文件夹），显示所有图片
                 if (folderPath === '') return true;
                 const imgFolder = normalizePath(img.folder || '');
-                // 精确匹配或子文件夹匹配
                 return imgFolder === folderPath || imgFolder.startsWith(folderPath + '/');
             }
 
-            function measureRowHeight() {
-                // 如果已有缓存的测量结果，直接返回
-                if (measuredRowHeight !== null) return measuredRowHeight;
+            function imageMatchesCurrentFilters(img) {
+                if (activeFolder !== null && !imageBelongsToFolder(img, activeFolder)) return false;
 
+                const query = searchInput.value.trim().toLowerCase();
+                if (query && !img.name.toLowerCase().includes(query)) return false;
+
+                const startValue = filterDateStart.value;
+                const endValue = filterDateEnd.value;
+                if (startValue || endValue) {
+                    const start = startValue ? new Date(startValue + 'T00:00:00').getTime() : null;
+                    const end = endValue ? new Date(endValue + 'T23:59:59.999').getTime() : null;
+                    const time = img.modified || 0;
+                    if (start && time < start) return false;
+                    if (end && time > end) return false;
+                }
+
+                return true;
+            }
+
+            function measureRowHeight() {
                 const tempCard = createCardElement({ url: '', name: '测量用', folder: '测试', size: 1024, modified: Date.now() }, 0);
                 tempCard.style.position = 'fixed';
                 tempCard.style.visibility = 'hidden';
@@ -883,19 +1083,16 @@
                 document.body.appendChild(tempCard);
                 const height = tempCard.getBoundingClientRect().height;
                 document.body.removeChild(tempCard);
-                measuredRowHeight = height || 260;
-                return measuredRowHeight;
+                return height || 260;
             }
 
             function updateLayoutParams() {
-                const oldColumnCount = columnCount;
+                const oldWidth = containerWidth;
                 containerWidth = scrollContainer.clientWidth;
                 if (containerWidth <= 0) return;
                 const minColWidth = 180;
                 columnCount = Math.max(1, Math.floor((containerWidth + gap) / (minColWidth + gap)));
-                // 列数变化或首次调用时重新测量
-                if (oldColumnCount !== columnCount || rowHeight === 260) {
-                    measuredRowHeight = null;
+                if (containerWidth !== oldWidth || rowHeight === 260) {
                     rowHeight = measureRowHeight();
                 }
             }
@@ -947,12 +1144,13 @@
                     if (!card) {
                         card = createCardElement(img, i);
                         card.style.width = colWidth + 'px';
-                        card.style.transform = `translate(${left}px, ${top}px)`;
+                        card.style.left = left + 'px';
+                        card.style.top = top + 'px';
                         visibleContent.appendChild(card);
                     } else {
                         card.style.display = '';
-                        card.style.width = colWidth + 'px';
-                        card.style.transform = `translate(${left}px, ${top}px)`;
+                        card.style.left = left + 'px';
+                        card.style.top = top + 'px';
                         card.dataset.index = i;
                     }
                     card.dataset.lastVisibleAt = String(now);
@@ -979,16 +1177,18 @@
             function createCardElement(img, globalIndex) {
                 const card = document.createElement('div');
                 card.className = 'image-card';
-                card.dataset.imageId = getImageId(img);
+                const imageId = getImageId(img);
+                card.dataset.imageId = imageId;
                 card.dataset.index = globalIndex;
                 
                 const imgContainer = document.createElement('div');
                 imgContainer.className = 'img-container';
                 
                 const imageEl = document.createElement('img');
-                imageEl.dataset.src = getImageId(img);
+                imageEl.dataset.src = imageId;
                 imageEl.alt = img.name;
                 imageEl.setAttribute('decoding', 'async');
+                imageEl.setAttribute('loading', 'lazy');
                 imageEl.style.width = '100%';
                 imageEl.style.height = '100%';
                 
@@ -1029,9 +1229,9 @@
                 
                 imgElements.forEach(img => {
                     if (!img.src && !img.classList.contains('loaded') && !img.classList.contains('error') && !img.dataset.scheduled && isInViewport(img)) {
-                        const found = findImageByUrl(img.dataset.src);
-                        if (found) {
-                            const imgData = found.data;
+                        const src = img.dataset.src;
+                        const imgData = imageIndex.get(src);
+                        if (imgData) {
                             const fileSize = imgData.size || 0;
                             if (fileSize >= CONFIG.THUMBNAIL_SIZE_THRESHOLD) {
                                 largeImages.push({ element: img, data: imgData });
@@ -1066,40 +1266,17 @@
                     batchDelay += CONFIG.BATCH_INTERVAL;
                 }
                 
-                // 滚动中也处理少量大图，避免持续滚动时页面长时间空白
-                const maxLargeImages = isScrolling ? 2 : largeImages.length;
-                const largeImagesToProcess = largeImages.slice(0, maxLargeImages);
-
-                largeImagesToProcess.forEach(({ element, data }) => {
-                    markImageScheduled(element, 'large');
-                    
-                    scheduleWorkerTask(async () => atomicThumbnailTask(await ensureImageObjectUrl(data)))
-                        .then(thumbnailUrl => {
-                            if (generation !== loadGeneration) {
-                                revokeObjectUrl(thumbnailUrl);
-                                return;
-                            }
-                            thumbnailCache.set(getImageId(data), thumbnailUrl);
-                            if (!element.isConnected) return;
-                            
-                            log('debug', '[THUMB] Generated, now loading:', data.name);
-                            
-                            resetImageLoadState(element);
-                            loadImageWithPlaceholder(element, data, generation).catch(err => {
-                                log('error', '[THUMB] Load after generation failed:', err);
-                            });
-                        })
-                        .catch(err => {
-                            if (generation !== loadGeneration) return;
-                            log('error', '[THUMB] Generation failed:', data.name, err);
-                            
-                            resetImageLoadState(element, true);
-                            showErrorState(element);
+                if (!isScrolling) {
+                    largeImages.forEach(({ element, data }) => {
+                        markImageScheduled(element, 'large');
+                        loadImageWithPlaceholder(element, data, generation).catch(err => {
+                            log('error', '[THUMB] Load failed:', data.name, err);
                         });
-                });
-
-                if (isScrolling && largeImages.length > maxLargeImages) {
-                    log('debug', '[PAUSE] Scrolling, deferred', largeImages.length - maxLargeImages, 'thumbnail tasks');
+                    });
+                } else {
+                    if (largeImages.length > 0) {
+                        log('debug', '[PAUSE] Scroll paused, skipping', largeImages.length, 'thumbnail generation tasks');
+                    }
                 }
             }
             
@@ -1142,108 +1319,116 @@
                 });
             }
             
-            async function loadImageWithPlaceholder(imgElement, imgData, generation = loadGeneration) {
+            async function loadImageWithPlaceholder(imgElement, imgData, generation = loadGeneration, retryCount = 0) {
                 if (generation !== loadGeneration) return;
                 if (!imgElement.isConnected) return;
-                if (imgElement.classList.contains('loaded')) return;
+                if (imgElement.classList.contains('loaded') || imgElement.classList.contains('error')) {
+                    resetImageLoadState(imgElement);
+                    log('debug', '[SKIP] Already loaded or error:', imgData.name);
+                    return;
+                }
                 
                 const fileSize = imgData.size || 0;
                 const isLargeImage = fileSize >= CONFIG.THUMBNAIL_SIZE_THRESHOLD;
-                const maxRetries = 2;
-                let attempt = 0;
                 
-                while (attempt <= maxRetries) {
-                    attempt++;
-                    try {
-                        let imageUrl = await ensureImageObjectUrl(imgData);
-                        
-                        if (!imageUrl || !imageUrl.startsWith('blob:')) {
-                            log('warn', '[ERROR] Invalid Object URL:', imgData.name);
-                            showErrorState(imgElement, '图片链接失效');
-                            return;
-                        }
-                        
-                        if (isLargeImage) {
-                            const cachedThumbnail = thumbnailCache.get(getImageId(imgData));
-                            if (cachedThumbnail) {
-                                imageUrl = cachedThumbnail;
-                            } else {
-                                try {
-                                    const thumbnailUrl = await scheduleWorkerTask(() => 
-                                        atomicThumbnailTask(imageUrl)
-                                    );
-                                    if (generation !== loadGeneration) {
-                                        revokeObjectUrl(thumbnailUrl);
-                                        return;
-                                    }
-                                    thumbnailCache.set(getImageId(imgData), thumbnailUrl);
-                                    imageUrl = thumbnailUrl;
-                                } catch (thumbErr) {
-                                    log('warn', '[THUMB] Failed, falling back to original:', imgData.name);
-                                    // 缩略图失败则回退到原图加载
+                log('debug', '[LOAD] Starting load:', imgData.name, 'Size:', imgData.size || 0);
+                
+                try {
+                    let imageUrl = await ensureImageObjectUrl(imgData);
+                    if (generation !== loadGeneration) return;
+                    
+                    if (!imageUrl || !imageUrl.startsWith('blob:')) {
+                        throw new Error('Invalid Object URL');
+                    }
+                    
+                    if (isLargeImage) {
+                        log('debug', '[THUMB] Processing large image:', imgData.name);
+                        const thumbnailKey = getImageId(imgData);
+                        const cachedThumbnail = thumbnailCache.get(thumbnailKey);
+                        if (cachedThumbnail) {
+                            log('debug', '[THUMB] Using cached thumbnail:', imgData.name);
+                            imageUrl = cachedThumbnail;
+                        } else {
+                            log('debug', '[THUMB] Generating thumbnail via worker:', imgData.name);
+                            try {
+                                const thumbnailUrl = await scheduleWorkerTask(() => 
+                                    atomicThumbnailTask(imageUrl)
+                                );
+                                if (generation !== loadGeneration) {
+                                    try { URL.revokeObjectURL(thumbnailUrl); } catch (e) {}
+                                    return;
                                 }
+                                
+                                thumbnailCache.set(thumbnailKey, thumbnailUrl);
+                                imageUrl = thumbnailUrl;
+                                log('debug', '[THUMB] Thumbnail generated successfully:', imgData.name);
+                            } catch (thumbErr) {
+                                log('warn', '[THUMB] Thumbnail generation failed, falling back to original:', imgData.name, thumbErr);
                             }
                         }
-                        
-                        const loaded = await new Promise((resolve, reject) => {
-                            let timeout;
-                            
-                            imgElement.onload = () => {
-                                clearTimeout(timeout);
-                                resolve(true);
-                            };
-                            imgElement.onerror = () => {
-                                clearTimeout(timeout);
-                                if (imgElement.complete && imgElement.naturalWidth > 0) {
-                                    resolve(true);
-                                } else {
-                                    reject(new Error('Image load failed'));
-                                }
-                            };
-                            
-                            imgElement.dataset.loadingStarted = String(Date.now());
-                            imgElement.src = imageUrl;
-                            
-                            timeout = setTimeout(() => {
-                                if (imgElement.complete && imgElement.naturalWidth > 0) {
-                                    resolve(true);
-                                } else {
-                                    reject(new Error('Load timeout'));
-                                }
-                            }, 30000);
-                        });
-                        
-                        if (generation !== loadGeneration) return;
-                        if (!loaded) continue;
-                        
-                        imgElement.classList.add('loaded');
-                        resetImageLoadState(imgElement);
-                        const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
-                        if (placeholder) placeholder.remove();
-                        return;
-                        
-                    } catch (err) {
-                        if (generation !== loadGeneration) return;
-                        log('warn', `[RETRY ${attempt}/${maxRetries + 1}] Load issue:`, imgData.name, err.message);
-                        
-                        // 重试前清理状态
-                        resetImageLoadState(imgElement);
-                        imgElement.src = '';
-                        imgElement.removeAttribute('src');
-                        
-                        // 最后一次仍失败，标记错误
-                        if (attempt > maxRetries) {
-                            showErrorState(imgElement, '加载失败（点击重试）', () => {
-                                // 点击错误区域重新触发加载
-                                showRetryState(imgElement);
-                                observeVisibleImages();
-                            });
-                            return;
-                        }
-                        
-                        // 简单的退避延迟
-                        await new Promise(r => setTimeout(r, 300 * attempt));
+                    } else {
+                        log('debug', '[SMALL] Loading small image directly:', imgData.name);
                     }
+                    
+                    await new Promise((resolve, reject) => {
+                        let timeout;
+                        
+                        imgElement.onload = () => {
+                            clearTimeout(timeout);
+                            log('info', '[OK] Image loaded successfully:', imgData.name);
+                            resolve();
+                        };
+                        
+                        imgElement.onerror = () => {
+                            clearTimeout(timeout);
+                            if (imgElement.complete && imgElement.naturalWidth > 0) {
+                                resolve();
+                            } else {
+                                log('error', '[ERROR] Image load failed:', imgData.name);
+                                reject(new Error('Image load failed'));
+                            }
+                        };
+                        
+                        imgElement.dataset.loadingStarted = String(Date.now());
+                        imgElement.src = imageUrl;
+                        
+                        timeout = setTimeout(() => {
+                            if (imgElement.complete && imgElement.naturalWidth > 0) {
+                                resolve();
+                            } else {
+                                log('error', '[TIMEOUT] Load timeout:', imgData.name);
+                                reject(new Error('Load timeout'));
+                            }
+                        }, 30000);
+                    });
+                    
+                    if (generation !== loadGeneration) return;
+
+                    // 加载成功
+                    imgElement.classList.add('loaded');
+                    resetImageLoadState(imgElement);
+                    const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
+                    if (placeholder) placeholder.remove();
+                    log('debug', '[DONE] Image processing complete:', imgData.name);
+                    
+                } catch (err) {
+                    if (generation !== loadGeneration) return;
+                    log('error', '[EXCEPTION] Failed to load image:', imgData.name, err);
+                    
+                    resetImageLoadState(imgElement);
+                    
+                    imgElement.src = '';
+                    imgElement.removeAttribute('src');
+
+                    if (retryCount < 2) {
+                        await new Promise(resolve => setTimeout(resolve, 300 * (retryCount + 1)));
+                        return loadImageWithPlaceholder(imgElement, imgData, generation, retryCount + 1);
+                    }
+
+                    showErrorState(imgElement, '加载失败（点击重试）', () => {
+                        showRetryState(imgElement);
+                        observeVisibleImages();
+                    });
                 }
             }
             
@@ -1261,29 +1446,26 @@
                 placeholder.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;font-size:0.8rem;cursor:pointer;padding:8px;text-align:center;" title="点击重试">${escapeHtml(message)}</div>`;
                 placeholder.classList.add('error');
                 if (onClick) {
-                    placeholder.querySelector('div').onclick = (e) => {
-                        e.stopPropagation();
+                    placeholder.querySelector('div').onclick = event => {
+                        event.stopPropagation();
                         onClick();
                     };
                 }
             }
-            
-            // 重置为重新加载状态
+
             function showRetryState(imgElement) {
-                imgElement.classList.remove('error');
-                imgElement.classList.remove('loaded');
+                imgElement.classList.remove('error', 'loaded');
                 resetImageLoadState(imgElement);
                 const container = imgElement.parentElement;
-                if (container) {
-                    const placeholder = container.querySelector('.img-loading-placeholder');
-                    if (placeholder) {
-                        placeholder.classList.remove('error');
-                        placeholder.innerHTML = '';
-                    } else {
-                        const newPlaceholder = document.createElement('div');
-                        newPlaceholder.className = 'img-loading-placeholder';
-                        container.insertBefore(newPlaceholder, container.firstChild);
-                    }
+                if (!container) return;
+                const placeholder = container.querySelector('.img-loading-placeholder');
+                if (placeholder) {
+                    placeholder.classList.remove('error');
+                    placeholder.innerHTML = '';
+                } else {
+                    const newPlaceholder = document.createElement('div');
+                    newPlaceholder.className = 'img-loading-placeholder';
+                    container.insertBefore(newPlaceholder, container.firstChild);
                 }
             }
             
@@ -1311,60 +1493,42 @@
                 }
             }
 
-            function updateStats(images) {
-                statImages.textContent = images.length;
+            function updateDisplay() {
+                let filtered = getFilteredImages();
+                // 排序
+                const [sortKey, sortOrder] = currentSort.split('-');
+                filtered.sort((a, b) => {
+                    let valA, valB;
+                    if (sortKey === 'name') {
+                        valA = a.name.toLowerCase();
+                        valB = b.name.toLowerCase();
+                    } else if (sortKey === 'date') {
+                        valA = a.modified || 0;
+                        valB = b.modified || 0;
+                    } else if (sortKey === 'size') {
+                        valA = a.size || 0;
+                        valB = b.size || 0;
+                    }
+                    if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
+                    if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
+                    return 0;
+                });
+
+                currentDisplayImages = filtered;
+                rebuildImageIndex();
+                displayRevision++;
+                statImages.textContent = filtered.length;
+                
+                // 优化统计计算：避免重复创建 Set，使用更高效的计算方式
                 const folderSet = new Set();
                 let totalSize = 0;
-                for (let i = 0; i < images.length; i++) {
-                    const img = images[i];
+                for (let i = 0; i < filtered.length; i++) {
+                    const img = filtered[i];
                     folderSet.add(normalizePath(img.folder || '根目录'));
                     totalSize += img.size || 0;
                 }
                 statFolders.textContent = folderSet.size;
                 statSize.textContent = formatSize(totalSize);
-            }
-
-            function rebuildImageIndex() {
-                imageIndex.clear();
-                for (let i = 0; i < currentDisplayImages.length; i++) {
-                    imageIndex.set(getImageId(currentDisplayImages[i]), i);
-                }
-            }
-
-            function findImageByUrl(imageId) {
-                const idx = imageIndex.get(imageId);
-                if (idx !== undefined) return { index: idx, data: currentDisplayImages[idx] };
-                const foundIdx = currentDisplayImages.findIndex(item => getImageId(item) === imageId);
-                if (foundIdx !== -1) return { index: foundIdx, data: currentDisplayImages[foundIdx] };
-                return null;
-            }
-
-            function updateDisplay() {
-                let filtered = getFilteredImages();
-                // 扫描期间：按扫描顺序（追加顺序）渲染，跳过 O(N log N) 排序以避免掉帧
-                if (!isScanning) {
-                    const [sortKey, sortOrder] = currentSort.split('-');
-                    filtered.sort((a, b) => {
-                        let valA, valB;
-                        if (sortKey === 'name') {
-                            valA = a.name.toLowerCase();
-                            valB = b.name.toLowerCase();
-                        } else if (sortKey === 'date') {
-                            valA = a.modified || 0;
-                            valB = b.modified || 0;
-                        } else if (sortKey === 'size') {
-                            valA = a.size || 0;
-                            valB = b.size || 0;
-                        }
-                        if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
-                        if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
-                        return 0;
-                    });
-                }
-
-                currentDisplayImages = filtered;
-                rebuildImageIndex();
-                updateStats(filtered);
                 
                 document.querySelectorAll('.tree-item').forEach(el => el.classList.remove('active'));
                 
@@ -1395,60 +1559,43 @@
                 observeVisibleImages();
             }
 
-            function getFilteredImages(includeSearchAndDate = true) {
-                let filtered = [...allImages];
-                if (activeFolder !== null) {
-                    filtered = filtered.filter(img => imageBelongsToFolder(img, activeFolder));
-                }
-                if (!includeSearchAndDate) return filtered;
-
-                const q = searchInput.value.trim().toLowerCase();
-                if (q) {
-                    filtered = filtered.filter(img => img.name.toLowerCase().includes(q));
-                }
-                
-                // 日期筛选
-                const startVal = filterDateStart.value;
-                const endVal = filterDateEnd.value;
-                if (startVal || endVal) {
-                    const start = startVal ? new Date(startVal + 'T00:00:00').getTime() : null;
-                    const end = endVal ? new Date(endVal + 'T23:59:59.999').getTime() : null;
-                    filtered = filtered.filter(img => {
-                        const time = img.modified || 0;
-                        if (start && time < start) return false;
-                        if (end && time > end) return false;
-                        return true;
-                    });
-                }
-                return filtered;
+            function getFilteredImages() {
+                return allImages.filter(imageMatchesCurrentFilters);
             }
 
             // ---------- 灯箱与缩放 ----------
             let currentLightboxList = [];
             let currentIndex = -1;
+            let lightboxOpenToken = 0;
 
             async function openLightbox(idx, list){
                 if(!list.length) return;
+                const token = ++lightboxOpenToken;
                 currentLightboxList = list;
                 currentIndex = idx;
                 const img = list[idx];
+                let url;
+                try {
+                    url = await ensureImageObjectUrl(img);
+                } catch (err) {
+                    if (token === lightboxOpenToken) {
+                        showToast('❌ 无法读取图片：' + err.message);
+                    }
+                    return;
+                }
+                if (token !== lightboxOpenToken) return;
+                lightboxImg.src = url;
                 lightbox.style.display = 'flex';
                 lightboxPrev.style.display = list.length>1?'flex':'none';
                 lightboxNext.style.display = list.length>1?'flex':'none';
                 resetZoom();
-                try {
-                    lightboxImg.src = await ensureImageObjectUrl(img);
-                } catch (err) {
-                    showToast('❌ 无法打开图片：' + err.message);
-                    closeLightbox();
-                }
             }
 
             function closeLightbox(){ 
+                lightboxOpenToken++;
                 lightbox.style.display='none'; 
                 lightboxImg.src=''; 
                 resetZoom();
-                // 清理状态，防止内存泄漏
                 currentLightboxList = [];
                 currentIndex = -1;
             }
@@ -1666,17 +1813,12 @@
                             closeLightbox();
                         }
                     }
-                    const shortcuts = [
-                        { keys: ['ArrowLeft'], fn: () => navLightbox(-1) },
-                        { keys: ['ArrowRight'], fn: () => navLightbox(1) },
-                        { keys: ['+', '='], fn: zoomIn },
-                        { keys: ['-'], fn: zoomOut },
-                        { keys: ['0'], fn: resetZoom },
-                        { keys: [' '], fn: toggleFullscreen }
-                    ];
-                    for (const s of shortcuts) {
-                        if (s.keys.includes(e.key)) { e.preventDefault(); s.fn(); }
-                    }
+                    if(e.key==='ArrowLeft') { e.preventDefault(); navLightbox(-1); }
+                    if(e.key==='ArrowRight') { e.preventDefault(); navLightbox(1); }
+                    if(e.key==='+' || e.key==='=') { e.preventDefault(); zoomIn(); }
+                    if(e.key==='-') { e.preventDefault(); zoomOut(); }
+                    if(e.key==='0') { e.preventDefault(); resetZoom(); }
+                    if(e.key==='f' || e.key==='F') { e.preventDefault(); toggleFullscreen(); }
                 }
             });
 
@@ -1693,6 +1835,7 @@
             sortSelect.addEventListener('change', () => {
                 currentSort = sortSelect.value;
                 updateDisplay();
+                scheduleSaveUISettings();
             });
 
             applyFilterBtn.addEventListener('click', () => {
@@ -1714,189 +1857,405 @@
                 }, CONFIG.SEARCH_DEBOUNCE);
             });
 
-            async function handleSelectFolder() {
-                if (folderSelectionInProgress) {
-                    showToast('正在处理当前文件夹，请稍候');
+            function collectTreePaths(node, paths = new Set()) {
+                if (!node) return paths;
+                paths.add(node.path);
+                Object.values(node.children).forEach(child => collectTreePaths(child, paths));
+                return paths;
+            }
+
+            function refreshFolderTreeSilently() {
+                const nextTree = buildFolderTree(allImages, currentRootFolder);
+                const expanded = getExpandedFolderPaths();
+                const oldPaths = collectTreePaths(folderTree);
+                const nextPaths = collectTreePaths(nextTree);
+                const sameStructure = !!folderTree && oldPaths.size === nextPaths.size &&
+                    [...oldPaths].every(path => nextPaths.has(path));
+
+                if (!sameStructure) {
+                    folderTree = nextTree;
+                    renderTree(expanded);
                     return;
                 }
 
-                folderSelectionInProgress = true;
-                const originalButtonText = selectFolderBtn.textContent;
-                selectFolderBtn.disabled = true;
+                function applyNodeMetadata(currentNode, nextNode) {
+                    currentNode.totalImages = nextNode.totalImages;
+                    currentNode._handle = nextNode._handle;
+                    if (currentNode._countEl) currentNode._countEl.textContent = nextNode.totalImages;
+                    Object.keys(currentNode.children).forEach(name => {
+                        applyNodeMetadata(currentNode.children[name], nextNode.children[name]);
+                    });
+                }
+                applyNodeMetadata(folderTree, nextTree);
+            }
+
+            function pathsOverlap(pathA, pathB) {
+                const a = normalizePath(pathA || '');
+                const b = normalizePath(pathB || '');
+                return !a || !b || a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
+            }
+
+            async function scanDirHandle(handle, pathPrefix, generation, onImage, skipPath = null) {
+                if (generation !== scanGeneration) return false;
+                const currentPath = normalizePath(pathPrefix || '');
+                folderHandleMap.set(currentPath, handle);
+                let iterationCount = 0;
+                for await (const entry of handle.values()) {
+                    if (generation !== scanGeneration) return false;
+                    iterationCount++;
+                    if (entry.kind === 'file') {
+                        const ext = entry.name.split('.').pop().toLowerCase();
+                        if (imageExtensions.has(ext)) {
+                            const file = await entry.getFile();
+                            if (generation !== scanGeneration) return false;
+                            onImage({
+                                id: imageIdentityKey(currentPath, entry.name, file.size, file.lastModified),
+                                handle: entry,
+                                url: null,
+                                name: entry.name,
+                                folder: currentPath,
+                                size: file.size,
+                                modified: file.lastModified
+                            });
+                        }
+                    } else if (entry.kind === 'directory') {
+                        const childPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
+                        folderHandleMap.set(childPath, entry);
+                        if (skipPath && childPath === skipPath) continue;
+                        const completed = await scanDirHandle(entry, childPath, generation, onImage, skipPath);
+                        if (!completed) return false;
+                    }
+                    if (iterationCount % 50 === 0) {
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                        if (generation !== scanGeneration) return false;
+                    }
+                }
+                return generation === scanGeneration;
+            }
+
+            async function runFullScan(dirHandle, options = {}) {
+                const generation = ++scanGeneration;
+                const uiState = options.uiState || {};
+                let priorityPath = normalizePath(
+                    options.priorityPath ??
+                    uiState.activeFolder ??
+                    options.activeFolder ??
+                    ''
+                );
+                activeFolder = normalizePath(
+                    uiState.activeFolder ??
+                    options.activeFolder ??
+                    priorityPath
+                );
+                currentSort = uiState.currentSort || currentSort;
+                sortSelect.value = currentSort;
+
+                const expandedPathSet = new Set(
+                    uiState.expandedFolders ||
+                    options.expandedFolders ||
+                    getExpandedFolderPaths()
+                );
+                getAncestorPaths(activeFolder).forEach(path => expandedPathSet.add(path));
+
+                isScanning = true;
+                currentRootDirHandle = dirHandle;
+                currentRootFolder = dirHandle.name;
+                folderHandleMap = new Map([['', dirHandle]]);
+                updateSyncButtonVisibility();
+
+                cleanupAllResources();
+                allImages = [];
+                searchInput.value = '';
+                scrollContainer.scrollTop = 0;
+                visibleContent.innerHTML = '';
+                folderTree = buildFolderTree(allImages, currentRootFolder);
+                renderTree([...expandedPathSet]);
+                updateDisplay();
+
+                const sidebar = document.getElementById('sidebar');
+                const overlay = document.getElementById('sidebarOverlay');
+                sidebar.classList.toggle('collapsed', !isMobileLayout() && !!uiState.sidebarCollapsedDesktop);
+                sidebar.classList.remove('open');
+                overlay.style.display = 'none';
+                updateSidebarToggleIcon();
+
+                let displayedScanSize = 0;
+                let displayedScanFolders = new Set();
+                let previewDisplayRevision = displayRevision;
+                const dirtyCountNodes = new Set();
+                let previewTimer = null;
+                let lastPreviewAt = 0;
+                const refreshScanPreview = () => {
+                    previewTimer = null;
+                    if (generation !== scanGeneration) return;
+                    dirtyCountNodes.forEach(node => {
+                        if (node._countEl) node._countEl.textContent = node.totalImages;
+                    });
+                    dirtyCountNodes.clear();
+                    if (previewDisplayRevision !== displayRevision) {
+                        displayedScanSize = 0;
+                        displayedScanFolders = new Set();
+                        for (const image of currentDisplayImages) {
+                            displayedScanSize += image.size || 0;
+                            displayedScanFolders.add(normalizePath(image.folder || '') || '__root__');
+                        }
+                        previewDisplayRevision = displayRevision;
+                    }
+                    statImages.textContent = currentDisplayImages.length;
+                    statFolders.textContent = displayedScanFolders.size;
+                    statSize.textContent = formatSize(displayedScanSize);
+                    updateLayoutParams();
+                    renderedStartIndex = -1;
+                    renderedEndIndex = -1;
+                    renderVisibleItems();
+                    observeVisibleImages();
+                    lastPreviewAt = performance.now();
+                };
+                const schedulePreview = () => {
+                    if (previewTimer || generation !== scanGeneration) return;
+                    const delay = Math.max(0, 300 - (performance.now() - lastPreviewAt));
+                    previewTimer = setTimeout(() => requestAnimationFrame(refreshScanPreview), delay);
+                };
+                const appendScannedImage = image => {
+                    ensureIncrementalFolderNode(
+                        image.folder,
+                        folderHandleMap.get(normalizePath(image.folder || '')) || null,
+                        expandedPathSet
+                    );
+                    allImages.push(image);
+                    incrementFolderCounts(image.folder, dirtyCountNodes);
+                    if (imageMatchesCurrentFilters(image)) {
+                        currentDisplayImages.push(image);
+                        imageIndex.set(getImageId(image), image);
+                        displayedScanSize += image.size || 0;
+                        displayedScanFolders.add(normalizePath(image.folder || '') || '__root__');
+                    }
+                    schedulePreview();
+                };
 
                 try {
+                    let priorityHandle = null;
+                    if (priorityPath) {
+                        try {
+                            priorityHandle = await resolveDirectoryHandleByPath(dirHandle, priorityPath);
+                        } catch (err) {
+                            if (err.name && err.name !== 'NotFoundError') throw err;
+                            priorityPath = '';
+                            activeFolder = '';
+                            expandedPathSet.clear();
+                            expandedPathSet.add('');
+                            renderTree([...expandedPathSet]);
+                            updateDisplay();
+                        }
+                    }
+
+                    if (priorityHandle) {
+                        const priorityStartCount = allImages.length;
+                        const priorityCompleted = await scanDirHandle(
+                            priorityHandle,
+                            priorityPath,
+                            generation,
+                            appendScannedImage
+                        );
+                        if (!priorityCompleted || generation !== scanGeneration) return false;
+                        if (previewTimer) {
+                            clearTimeout(previewTimer);
+                            previewTimer = null;
+                        }
+                        refreshScanPreview();
+                        if (allImages.length === priorityStartCount) {
+                            priorityPath = '';
+                            activeFolder = '';
+                            expandedPathSet.clear();
+                            expandedPathSet.add('');
+                        }
+                        updateDisplay();
+                        await new Promise(resolve => requestAnimationFrame(resolve));
+                    }
+
+                    const completed = await scanDirHandle(
+                        dirHandle,
+                        '',
+                        generation,
+                        appendScannedImage,
+                        priorityPath || null
+                    );
+                    if (!completed || generation !== scanGeneration) return false;
+                    if (previewTimer) {
+                        clearTimeout(previewTimer);
+                        previewTimer = null;
+                    }
+                    refreshScanPreview();
+
+                    const nextTree = buildFolderTree(allImages, currentRootFolder);
+                    folderTree = nextTree;
+                    if (activeFolder && !getFolderNode(activeFolder)) {
+                        activeFolder = '';
+                        expandedPathSet.add('');
+                    }
+                    renderTree([...expandedPathSet]);
+                    updateDisplay();
+                    if (window.innerWidth > 768 && uiState.sidebarCollapsedDesktop) {
+                        setTimeout(requestLayoutRefresh, 320);
+                    }
+                    scheduleSaveUISettings();
+                    return true;
+                } finally {
+                    if (previewTimer) clearTimeout(previewTimer);
+                    if (generation === scanGeneration) isScanning = false;
+                }
+            }
+
+            async function backgroundSync(targetHandle, targetPath) {
+                if (isScanning || !targetHandle) return false;
+                const currentGen = ++scanGeneration;
+                const normalizedTarget = normalizePath(targetPath || '');
+                const diskFilesMap = new Map();
+                let completed = false;
+                try {
+                    completed = await scanDirHandle(targetHandle, normalizedTarget, currentGen, image => {
+                        diskFilesMap.set(image.id, image);
+                    });
+                } catch (err) {
+                    if (currentGen === scanGeneration) log('warn', 'Background sync failed', err);
+                    return false;
+                }
+                if (!completed || currentGen !== scanGeneration) return false;
+                const diskFilesByLocation = new Map(
+                    [...diskFilesMap.values()].map(img => [fileLocationKey(img.folder, img.name), img])
+                );
+
+                const memoryFiles = allImages.filter(img => imageBelongsToFolder(img, normalizedTarget));
+                const memoryFilesMap = new Map(
+                    memoryFiles.map(img => [fileLocationKey(img.folder, img.name), img])
+                );
+                const removeSet = new Set();
+                const additions = [];
+
+                memoryFilesMap.forEach((memoryImage, locationKey) => {
+                    const diskImage = diskFilesByLocation.get(locationKey);
+                    if (!diskImage) {
+                        removeSet.add(memoryImage);
+                        revokeObjectUrl(memoryImage);
+                        return;
+                    }
+                    if (memoryImage.size !== diskImage.size || memoryImage.modified !== diskImage.modified) {
+                        revokeObjectUrl(memoryImage);
+                        memoryImage.id = diskImage.id;
+                        memoryImage.handle = diskImage.handle;
+                        memoryImage.size = diskImage.size;
+                        memoryImage.modified = diskImage.modified;
+                    } else {
+                        memoryImage.handle = diskImage.handle;
+                    }
+                });
+
+                diskFilesByLocation.forEach((diskImage, locationKey) => {
+                    if (!memoryFilesMap.has(locationKey)) additions.push(diskImage);
+                });
+
+                if (currentGen !== scanGeneration) return false;
+                if (removeSet.size) allImages = allImages.filter(img => !removeSet.has(img));
+                if (additions.length) allImages.push(...additions);
+                refreshFolderTreeSilently();
+
+                if (activeFolder !== null && pathsOverlap(activeFolder, normalizedTarget)) {
+                    updateDisplay();
+                }
+                return true;
+            }
+
+            async function handleSelectFolder() {
+                if (folderSelectionInProgress) return;
+                folderSelectionInProgress = true;
+                selectFolderBtn.disabled = true;
+                try {
                     const dirHandle = await window.showDirectoryPicker();
-                    const generation = ++scanGeneration;
-                    selectFolderBtn.textContent = '扫描中...';
-
-                    // 先清理所有旧资源
-                    cleanupAllResources();
-
-                    // 先进入浏览界面，扫描过程中逐批补充图片，避免首屏被读条阻塞
-                    isScanning = true;
-                    currentRootFolder = dirHandle.name;
-                    allImages = [];
-                    folderTree = { name: currentRootFolder || '根目录', path: '', children: {}, totalImages: 0 };
-                    activeFolder = ''; //  默认选中根目录（空字符串）
-                    searchInput.value = '';
-                    scrollContainer.scrollTop = 0;
-                    renderTree(); //  仅渲染根节点，子节点由 scanDirHandle 增量生长
-                    updateDisplay();
-
-                    let scannedCount = 0;
-                    let renderScheduled = false;
-                    let scanning = true;
-
-                    //  scheduleScanRender 仅负责主视图（图片网格）和统计信息刷新，
-                    //  侧边栏树结构由 scanDirHandle 的增量逻辑独立驱动。
-                    function scheduleScanRender() {
-                        if (generation !== scanGeneration) return;
-                        if (renderScheduled) return;
-                        renderScheduled = true;
-                        requestAnimationFrame(() => {
-                            if (generation !== scanGeneration) return;
-                            renderScheduled = false;
-                            const previewImages = getFilteredImages();
-                            currentDisplayImages = previewImages;
-                            rebuildImageIndex();
-                            updateStats(previewImages);
-                            updateLayoutParams();
-                            renderedStartIndex = -1;
-                            renderedEndIndex = -1;
-                            renderVisibleItems();
-                            observeVisibleImages();
-                        });
-                    }
-
-                    //  当目录首次被发现时，把它作为节点加入侧边栏（若尚未存在）
-                    function revealFolderInSidebar(folderPath) {
-                        if (!folderTree) return;
-                        if (folderPath === '') return;
-                        const parts = folderPath.split('/');
-                        let parentNode = folderTree;
-                        for (let i = 0; i < parts.length; i++) {
-                            const part = parts[i];
-                            const currentPath = parts.slice(0, i + 1).join('/');
-                            const level = i + 1;
-                            if (!parentNode.children[part]) {
-                                parentNode.children[part] = {
-                                    name: part,
-                                    path: currentPath,
-                                    children: {},
-                                    totalImages: 0
-                                };
-                            }
-                            const child = parentNode.children[part];
-                            if (!child._childrenEl) {
-                                const parentChildrenEl = parentNode._childrenEl;
-                                appendFolderNode(parentChildrenEl, child, level);
-                                if (parentNode._toggleEl) {
-                                    parentNode._toggleEl.style.visibility = '';
-                                    const pe = parentNode._childrenEl;
-                                    const tg = parentNode._toggleEl;
-                                    if (pe && pe.style.display === 'none') {
-                                        tg.classList.remove('expanded');
-                                        tg.classList.add('collapsed');
-                                    } else {
-                                        tg.classList.remove('collapsed');
-                                        tg.classList.add('expanded');
-                                    }
-                                }
-                            }
-                            parentNode = child;
-                        }
-                    }
-
-                    //  递归扫描：遇到子目录则 revealFolderInSidebar 增量生长；
-                    //  遇到图片则 allImages 入队，并通过 data-path 定位到侧边栏节点仅更新 .count。
-                    async function scanDirHandle(handle, pathPrefix = '') {
-                        if (generation !== scanGeneration) return;
-                        const currentPath = normalizePath(pathPrefix);
-                        for await (const entry of handle.values()) {
-                            if (generation !== scanGeneration) return;
-                            if (entry.kind === 'file') {
-                                const ext = entry.name.split('.').pop().toLowerCase();
-                                if (imageExtensions.has(ext)) {
-                                    const file = await entry.getFile();
-                                    if (generation !== scanGeneration) return;
-                                    const imgData = {
-                                        id: (currentPath ? currentPath + '/' : '') + entry.name + ':' + file.size + ':' + file.lastModified,
-                                        url: null,
-                                        handle: entry,
-                                        name: entry.name,
-                                        folder: currentPath,
-                                        size: file.size,
-                                        modified: file.lastModified
-                                    };
-                                    allImages.push(imgData);
-
-                                    //  更新内存树（O(1) 直接写入 _countEl，零 DOM 查询）
-                                    //  revealFolderInSidebar 已保证路径上所有内存节点必然存在
-                                    folderTree.totalImages++;
-                                    updateFolderCount(folderTree, folderTree.totalImages);
-                                    if (currentPath) {
-                                        const parts = currentPath.split('/');
-                                        let node = folderTree;
-                                        let syncFailed = false;
-                                        for (let i = 0; i < parts.length; i++) {
-                                            const part = parts[i];
-                                            if (!node.children[part]) {
-                                                //  内存树与文件系统不同步：仅警告并跳出当前路径追溯，绝不中断整个扫描
-                                                console.warn('Memory tree out of sync:', currentPath);
-                                                syncFailed = true;
-                                                break;
-                                            }
-                                            node = node.children[part];
-                                            node.totalImages++;
-                                            updateFolderCount(node, node.totalImages);
-                                        }
-                                        // syncFailed=true 时该图片不写入当前节点（仅影响该层级计数），
-                                        // allImages 全局数组已在前面 push，主视图渲染不受影响
-                                    }
-                                    // images.push(imgData) 已移除：allImages 是唯一数据源，
-                                    // 内存树节点仅负责 DOM 结构映射与 O(1) 计数更新
-
-                                    scannedCount++;
-                                    if (scannedCount === 1 || scannedCount % 100 === 0) {
-                                        scheduleScanRender();
-                                        await new Promise(resolve => setTimeout(resolve, 0));
-                                    }
-                                }
-                            } else if (entry.kind === 'directory') {
-                                const childPath = currentPath ? currentPath + '/' + entry.name : entry.name;
-                                //  发现子目录时，立即在侧边栏对应位置增量插入节点（实现动态生长）
-                                revealFolderInSidebar(childPath);
-                                await scanDirHandle(entry, childPath);
-                            }
-                        }
-                    }
-                    await scanDirHandle(dirHandle);
-                    if (generation !== scanGeneration) return;
-
-                    scanning = false;
-                    isScanning = false;
-                    //  扫描结束后执行一次完整的 updateDisplay：触发最终排序与视图刷新
-                    updateDisplay();
-                    showToast(`✅ 已加载 ${allImages.length} 张图片`);
+                    const sidebar = document.getElementById('sidebar');
+                    await idb.set('lastDirHandle', dirHandle);
+                    await idb.set('uiState', {
+                        activeFolder: '',
+                        expandedFolders: [''],
+                        sidebarCollapsedDesktop: sidebar.classList.contains('collapsed'),
+                        currentSort
+                    });
+                    await idb.set('pendingRootSwitch', true);
+                    location.reload();
                 } catch (err) {
                     if (err.name !== 'AbortError') {
-                        showToast('❌ 无法读取文件夹：' + err.message);
+                        showToast('❌ 无法保存文件夹：' + err.message);
                     }
                 } finally {
                     folderSelectionInProgress = false;
                     selectFolderBtn.disabled = false;
-                    selectFolderBtn.textContent = originalButtonText;
                 }
             }
+
+            async function handleSyncFolder() {
+                if (isScanning) return;
+                const targetPath = normalizePath(activeFolder || '');
+                const targetNode = getFolderNode(targetPath);
+                const targetHandle = targetNode && targetNode._handle;
+                if (!targetHandle) return;
+
+                syncFolderBtn.disabled = true;
+                const originalText = syncFolderBtn.textContent;
+                syncFolderBtn.textContent = '同步中...';
+                try {
+                    const completed = await backgroundSync(targetHandle, targetPath);
+                    if (completed) showToast('✅ 当前目录已同步至最新状态');
+                } catch (err) {
+                    showToast('❌ 同步失败：' + err.message);
+                } finally {
+                    syncFolderBtn.disabled = false;
+                    syncFolderBtn.textContent = originalText;
+                }
+            }
+
+            async function autoRestoreLastSession() {
+                try {
+                    const [dirHandle, uiState, pendingRootSwitch] = await Promise.all([
+                        idb.get('lastDirHandle'),
+                        idb.get('uiState'),
+                        idb.get('pendingRootSwitch')
+                    ]);
+                    if (pendingRootSwitch) {
+                        await idb.set('pendingRootSwitch', false);
+                    }
+                    if (!dirHandle) return;
+                    const permission = typeof dirHandle.queryPermission === 'function'
+                        ? await dirHandle.queryPermission({ mode: 'read' })
+                        : 'denied';
+                    if (permission !== 'granted') return;
+                    const restoredState = pendingRootSwitch
+                        ? {
+                            ...(uiState || {}),
+                            activeFolder: '',
+                            expandedFolders: ['']
+                        }
+                        : (uiState || {});
+                    await runFullScan(dirHandle, {
+                        uiState: restoredState,
+                        priorityPath: restoredState.activeFolder
+                    });
+                } catch (err) {
+                    log('warn', 'Automatic session restore failed', err);
+                }
+            }
+
             selectFolderBtn.addEventListener('click', handleSelectFolder);
+            syncFolderBtn.addEventListener('click', handleSyncFolder);
 
             scrollContainer.addEventListener('scroll', onScroll, { passive: true });
-
-            visibleContent.addEventListener('click', (e) => {
-                const card = e.target.closest('.image-card');
+            visibleContent.addEventListener('click', event => {
+                const card = event.target.closest('.image-card');
                 if (!card) return;
-                const idx = imageIndex.get(card.dataset.imageId);
-                if (idx !== undefined) openLightbox(idx, currentDisplayImages);
+                const currentIndex = Number(card.dataset.index);
+                if (Number.isInteger(currentIndex) &&
+                    currentIndex >= 0 &&
+                    currentIndex < currentDisplayImages.length) {
+                    openLightbox(currentIndex, currentDisplayImages);
+                }
             });
             
             // 优先使用 ResizeObserver，resize 事件作为降级方案并添加防抖
@@ -1904,7 +2263,6 @@
             const handleResize = () => {
                 clearTimeout(resizeDebounceTimer);
                 resizeDebounceTimer = setTimeout(() => {
-                    // 断点跨越时清理不匹配的状态类，防止桌面/移动状态混淆
                     const sidebar = document.getElementById('sidebar');
                     const overlay = document.getElementById('sidebarOverlay');
                     if (isMobileLayout()) {
@@ -1912,9 +2270,8 @@
                     } else {
                         sidebar.classList.remove('open');
                         overlay.style.display = 'none';
-                        applySavedSidebarState(); // 仅管理类，不触发刷新
                     }
-                    // 统一的虚拟列表布局刷新入口
+                    updateSidebarToggleIcon();
                     requestLayoutRefresh();
                 }, 150);
             };
@@ -1927,59 +2284,12 @@
                 window.addEventListener('resize', handleResize);
             }
 
-            // 监听浏览器页面缩放（Ctrl+滚轮/+/−）：这类操作仅改变 devicePixelRatio，
-            // scrollContainer.clientWidth（CSS 像素）保持不变，ResizeObserver 不会触发。
-            // 通过 matchMedia 监听 DPR 变化，变化时也重新布局。
-            (function setupDprListener() {
-                if (!window.matchMedia) return;
-                let currentMq = null;
-
-                function bindDprListener() {
-                    try {
-                        const mq = window.matchMedia('(resolution: ' + window.devicePixelRatio + 'dppx)');
-                        const onDprChange = function() {
-                            // 解绑旧的 matchMedia 监听器，防止内存泄漏
-                            if (currentMq) {
-                                if (currentMq.removeEventListener) {
-                                    currentMq.removeEventListener('change', onDprChange);
-                                } else if (currentMq.removeListener) {
-                                    currentMq.removeListener(onDprChange);
-                                }
-                            }
-                            handleResize();
-                            // 基于新的 DPR 重新绑定下一次监听（matchMedia 的 query 需要动态更新）
-                            bindDprListener();
-                        };
-                        if (mq.addEventListener) {
-                            mq.addEventListener('change', onDprChange);
-                        } else if (mq.addListener) {
-                            mq.addListener(onDprChange);
-                        }
-                        currentMq = mq;
-                    } catch (e) {}
-                }
-                bindDprListener();
-            })();
-
             folderTree = null;
             renderTree();
             updateDisplay();
-
-            // 初始化侧边栏状态：禁用过渡，直接应用目标状态。避免页面加载时产生"折叠动画"，
-            // 同时确保随后的 requestLayoutRefresh 能测量到正确的最终尺寸。
-            (function initSidebarState() {
-                const sidebar = document.getElementById('sidebar');
-                const overlay = document.getElementById('sidebarOverlay');
-                const savedTransition = sidebar.style.transition;
-                sidebar.style.transition = 'none';
-                applySavedSidebarState();
-                // 强制同步布局，让浏览器立即应用 no-transition 的样式
-                void scrollContainer.clientWidth;
-                sidebar.style.transition = savedTransition;
-                // 确保 overlay 的初始状态正确
-                overlay.style.display = 'none';
-            })();
-            requestLayoutRefresh();
+            updateSyncButtonVisibility();
+            updateSidebarToggleIcon();
+            autoRestoreLastSession();
             
             //  保存清理函数引用，用于页面卸载时移除 resize 监听器
             const cleanupResizeListener = () => {
