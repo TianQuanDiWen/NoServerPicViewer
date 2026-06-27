@@ -88,8 +88,10 @@
             border:1px solid var(--border); box-shadow:var(--shadow); cursor:pointer;
             transition:transform 0.2s, box-shadow 0.2s; display:flex; flex-direction:column;
             position:absolute;
+            transform: translate3d(var(--card-x, 0px), var(--card-y, 0px), 0);
+            will-change: transform;
         }
-        .image-card:hover { transform:translateY(-3px); box-shadow:var(--shadow-hover); }
+        .image-card:hover { transform:translate3d(var(--card-x, 0px), var(--card-y, 0px), 0) translateY(-3px); box-shadow:var(--shadow-hover); }
         .img-container {
             width:100%; aspect-ratio:4/3; background:#e0e0e5;
             position:relative; overflow:hidden;
@@ -325,6 +327,8 @@
             let renderedStartIndex = 0;
             let renderedEndIndex = 0;
             let resizeObserver = null;
+            let dprMediaQuery = null;
+            let dprMediaQueryHandler = null;
             let ticking = false;
             let currentScale = 1;
             let currentSort = 'date-desc';
@@ -452,6 +456,7 @@
                 objectUrlSet.clear();
                 allImages.forEach(img => {
                     if (img.url && img.url.startsWith('blob:')) img.url = null;
+                    delete img._objectUrlPromise;
                 });
             }
 
@@ -668,7 +673,14 @@
                 const d=new Date(ms);
                 return d.getFullYear()+'-'+(d.getMonth()+1).toString().padStart(2,'0')+'-'+d.getDate().toString().padStart(2,'0');
             }
-            function escapeHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+            function escapeHtml(value) {
+                return String(value ?? '')
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
             
             function isInViewport(imgElement) {
                 if (!imgElement.isConnected) return false;
@@ -736,15 +748,33 @@
             async function ensureImageObjectUrl(imgData) {
                 if (imgData.url && imgData.url.startsWith('blob:')) return imgData.url;
                 if (!imgData.handle) return imgData.url || '';
-                const file = await imgData.handle.getFile();
-                const url = URL.createObjectURL(file);
-                objectUrlSet.add(url);
-                imgData.url = url;
-                return url;
+                if (imgData._objectUrlPromise) {
+                    return imgData._objectUrlPromise;
+                }
+                const objectUrlPromise = (async () => {
+                    const file = await imgData.handle.getFile();
+                    const url = URL.createObjectURL(file);
+                    if (imgData._objectUrlPromise !== objectUrlPromise) {
+                        try { URL.revokeObjectURL(url); } catch (e) {}
+                        return imgData.url || '';
+                    }
+                    objectUrlSet.add(url);
+                    imgData.url = url;
+                    return url;
+                })();
+                imgData._objectUrlPromise = objectUrlPromise;
+                objectUrlPromise.catch(() => {
+                    if (imgData._objectUrlPromise === objectUrlPromise) {
+                        delete imgData._objectUrlPromise;
+                    }
+                });
+                return objectUrlPromise;
             }
 
             function revokeObjectUrl(imgData) {
-                if (!imgData || !imgData.url) return;
+                if (!imgData) return;
+                delete imgData._objectUrlPromise;
+                if (!imgData.url) return;
                 try { URL.revokeObjectURL(imgData.url); } catch (e) {}
                 objectUrlSet.delete(imgData.url);
                 thumbnailCache.delete(getImageId(imgData));
@@ -870,6 +900,33 @@
                 renderedEndIndex = -1;
                 renderVisibleItems();
                 observeVisibleImages();
+            }
+
+            function cleanupDprListener() {
+                if (!dprMediaQuery || !dprMediaQueryHandler) return;
+                if (typeof dprMediaQuery.removeEventListener === 'function') {
+                    dprMediaQuery.removeEventListener('change', dprMediaQueryHandler);
+                } else if (typeof dprMediaQuery.removeListener === 'function') {
+                    dprMediaQuery.removeListener(dprMediaQueryHandler);
+                }
+                dprMediaQuery = null;
+                dprMediaQueryHandler = null;
+            }
+
+            function setupDprListener() {
+                if (typeof window.matchMedia !== 'function') return;
+                cleanupDprListener();
+                const currentDpr = window.devicePixelRatio || 1;
+                dprMediaQuery = window.matchMedia(`(resolution: ${currentDpr}dppx)`);
+                dprMediaQueryHandler = () => {
+                    requestLayoutRefresh();
+                    setupDprListener();
+                };
+                if (typeof dprMediaQuery.addEventListener === 'function') {
+                    dprMediaQuery.addEventListener('change', dprMediaQueryHandler);
+                } else if (typeof dprMediaQuery.addListener === 'function') {
+                    dprMediaQuery.addListener(dprMediaQueryHandler);
+                }
             }
 
             function buildFolderTree(images, rootFolderName = '') {
@@ -1144,13 +1201,13 @@
                     if (!card) {
                         card = createCardElement(img, i);
                         card.style.width = colWidth + 'px';
-                        card.style.left = left + 'px';
-                        card.style.top = top + 'px';
+                        card.style.setProperty('--card-x', left + 'px');
+                        card.style.setProperty('--card-y', top + 'px');
                         visibleContent.appendChild(card);
                     } else {
                         card.style.display = '';
-                        card.style.left = left + 'px';
-                        card.style.top = top + 'px';
+                        card.style.setProperty('--card-x', left + 'px');
+                        card.style.setProperty('--card-y', top + 'px');
                         card.dataset.index = i;
                     }
                     card.dataset.lastVisibleAt = String(now);
@@ -2289,6 +2346,7 @@
             updateDisplay();
             updateSyncButtonVisibility();
             updateSidebarToggleIcon();
+            setupDprListener();
             autoRestoreLastSession();
             
             //  保存清理函数引用，用于页面卸载时移除 resize 监听器
@@ -2301,6 +2359,7 @@
             // 页面卸载时清理所有资源，防止内存泄漏
             window.addEventListener('beforeunload', () => {
                 cleanupResizeListener();
+                cleanupDprListener();
                 cleanupAllResources({ cleanupLayoutListeners: true });
             });
         })();
