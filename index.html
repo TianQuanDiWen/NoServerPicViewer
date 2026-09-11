@@ -187,7 +187,7 @@
     </style>
 </head>
 <body>
-    <div id="sidebarOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:199;display:none;" onclick="toggleSidebar()"></div>
+    <div id="sidebarOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:199;display:none;"></div>
 
     <aside class="sidebar" id="sidebar">
         <div class="sidebar-header"><span>📁 文件夹</span></div>
@@ -196,7 +196,7 @@
 
     <div class="main-area">
         <nav class="navbar">
-            <button class="btn sidebar-toggle" id="sidebarToggleBtn" onclick="toggleSidebar()" aria-label="切换侧边栏">☰</button>
+            <button class="btn sidebar-toggle" id="sidebarToggleBtn" aria-label="切换侧边栏">☰</button>
             <span class="logo">🖼️ 图片浏览器</span>
             <button class="btn primary" id="selectFolderBtn">📂 选择本地文件夹</button>
             <button class="btn" id="syncFolderBtn" style="display:none;">🔄 同步</button>
@@ -261,7 +261,6 @@
             const lightbox = document.getElementById('lightbox');
             const lightboxImg = document.getElementById('lightboxImg');
             const lightboxImgWrapper = document.getElementById('lightboxImgWrapper');
-            const lightboxClose = document.getElementById('lightboxClose');
             const lightboxPrev = document.getElementById('lightboxPrev');
             const lightboxNext = document.getElementById('lightboxNext');
             const lightboxZoomIn = document.getElementById('lightboxZoomIn');
@@ -327,10 +326,8 @@
             let currentRootFolder = ''; //  存储用户选择的根文件夹名称
             let currentDisplayImages = [];
             let imageIndex = new Map();
-            let displayRevision = 0;
             const imageExtensions = new Set(['jpg','jpeg','png','gif','webp','bmp','svg','tiff','tif','avif','ico','heic','heif','jfif']);
             
-            const CARD_INFO_HEIGHT = 74;
             let rowHeight = 260;
             let columnCount = 4;
             let containerWidth = 0;
@@ -342,6 +339,7 @@
             let lastScrollTop = 0;
             let lastScrollTime = 0;
             let scrollPauseTimer = null;
+            let toastTimer = null;
             
             let renderedStartIndex = 0;
             let renderedEndIndex = 0;
@@ -349,12 +347,6 @@
             let ticking = false;
             let currentScale = 1;
             let currentSort = 'date-desc';
-
-            function getReadyImageUrl(imgData) {
-                if (!imgData) return null;
-                const directUrl = (imgData.url && imgData.url.startsWith('blob:')) ? imgData.url : null;
-                return (isLargeImageData(imgData) ? thumbnailCache.get(getImageId(imgData)) : null) || directUrl;
-            }
             
             let panX = 0;
             let panY = 0;
@@ -373,6 +365,7 @@
             let resizeDebounceTimer = null;
 
             const CONFIG = {
+                CARD_INFO_HEIGHT: 74,
                 ROW_OVERSCAN: 6,
                 SCROLL_STOP_DELAY: 50,
                 SWIPE_THRESHOLD: 50,
@@ -509,10 +502,8 @@
             // 当前实现不是 Web Worker，也不创建线程。
             // 这里是主线程 Promise 并发队列，用于限制大图缩略图生成任务数量。
             // activeThumbnailTasks 表示当前正在执行的缩略图生成任务数量。
-            // MAX_CONCURRENT_THUMBNAIL_TASKS 表示允许同时执行的缩略图生成任务上限。
             // thumbnailTaskQueue 表示等待执行的缩略图任务队列。
             let activeThumbnailTasks = 0;
-            const MAX_CONCURRENT_THUMBNAIL_TASKS = CONFIG.MAX_CONCURRENT_THUMBNAIL_TASKS;
             let thumbnailTaskQueue = [];
 
             // 从源对象解析可用于解码的 Blob（支持 File, Blob, FileSystemFileHandle, 或 blob URL）
@@ -647,7 +638,7 @@
 
             // 派发缩略图任务：只要有空余槽位，就尽可能启动新的活跃任务
             function dispatchThumbnailTasks() {
-                while (activeThumbnailTasks < MAX_CONCURRENT_THUMBNAIL_TASKS && thumbnailTaskQueue.length > 0) {
+                while (activeThumbnailTasks < CONFIG.MAX_CONCURRENT_THUMBNAIL_TASKS && thumbnailTaskQueue.length > 0) {
                     const started = startNextThumbnailTask();
                     if (!started) break;
                 }
@@ -657,7 +648,7 @@
             // 1. 逆序扫描队列（LIFO：用户当前眼前最新的卡片最先被处理）
             // 2. 划出即淘汰：处于 card-hidden 或离架的任务直接丢弃，不执行昂贵压缩
             function startNextThumbnailTask() {
-                if (activeThumbnailTasks >= MAX_CONCURRENT_THUMBNAIL_TASKS || thumbnailTaskQueue.length === 0) {
+                if (activeThumbnailTasks >= CONFIG.MAX_CONCURRENT_THUMBNAIL_TASKS || thumbnailTaskQueue.length === 0) {
                     return false;
                 }
 
@@ -735,10 +726,11 @@
                     .replace(/'/g, '&#39;');
             }
             
-            function showToast(msg){
-                toast.textContent=msg; toast.classList.add('show');
-                clearTimeout(window._toastTimer);
-                window._toastTimer = setTimeout(()=>toast.classList.remove('show'),2000);
+            function showToast(msg) {
+                toast.textContent = msg;
+                toast.classList.add('show');
+                clearTimeout(toastTimer);
+                toastTimer = setTimeout(() => toast.classList.remove('show'), 2000);
             }
             function normalizePath(p) {
                 if (!p) return '';
@@ -928,7 +920,7 @@
                 }
             }
 
-            window.toggleSidebar = function() {
+            function toggleSidebar() {
                 const sidebar = document.getElementById('sidebar');
                 const overlay = document.getElementById('sidebarOverlay');
                 if (isMobileLayout()) {
@@ -947,7 +939,7 @@
                 }
                 updateSidebarToggleIcon();
                 scheduleSaveUISettings();
-            };
+            }
 
             function requestLayoutRefresh() {
                 updateLayoutParams();
@@ -1174,7 +1166,7 @@
                 if (containerWidth <= 0) return;
                 const minColWidth = CONFIG.GRID_MIN_COL_WIDTH;
                 columnCount = Math.max(1, Math.floor((containerWidth + gap) / (minColWidth + gap)));
-                rowHeight = Math.round(getCardColumnWidth() * 0.75 + CARD_INFO_HEIGHT);
+                rowHeight = Math.round(getCardColumnWidth() * 0.75 + CONFIG.CARD_INFO_HEIGHT);
             }
 
             function getTotalHeight() {
@@ -1208,7 +1200,6 @@
                 
                 const newVisibleIds = new Set();
                 const colWidth = getCardColumnWidth();
-                const now = Date.now();
                 
                 for (let i = startIndex; i < endIndex; i++) {
                     const img = currentDisplayImages[i];
@@ -1243,6 +1234,12 @@
                 });
                 
                 scrollPlaceholder.style.height = getTotalHeight() + 'px';
+            }
+
+            function getReadyImageUrl(imgData) {
+                if (!imgData) return null;
+                const directUrl = (imgData.url && imgData.url.startsWith('blob:')) ? imgData.url : null;
+                return (isLargeImageData(imgData) ? thumbnailCache.get(getImageId(imgData)) : null) || directUrl;
             }
 
             function createCardElement(img, globalIndex) {
@@ -1610,7 +1607,6 @@
 
                 currentDisplayImages = filtered;
                 rebuildImageIndex();
-                displayRevision++;
                 updateStatsDisplay(filtered);
                 
                 document.querySelectorAll('.tree-item').forEach(el => el.classList.remove('active'));
@@ -2305,6 +2301,8 @@
                 }
             }
 
+            document.getElementById('sidebarToggleBtn').addEventListener('click', toggleSidebar);
+            document.getElementById('sidebarOverlay').addEventListener('click', toggleSidebar);
             selectFolderBtn.addEventListener('click', handleSelectFolder);
             syncFolderBtn.addEventListener('click', handleSyncFolder);
 

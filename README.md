@@ -129,6 +129,7 @@ npx serve .
 
 ```javascript
 const CONFIG = {
+    CARD_INFO_HEIGHT: 74,                 // 卡片底部文字与元数据信息栏预留高度 (px)
     ROW_OVERSCAN: 6,                      // 虚拟滚动视口上下预加载的缓冲区行数
     SCROLL_STOP_DELAY: 50,                // 滚动停止判断防抖时间 (ms)
     SWIPE_THRESHOLD: 50,                  // 移动端手势滑动切换图片的灵敏度阈值 (px)
