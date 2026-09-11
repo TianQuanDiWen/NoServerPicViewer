@@ -21,9 +21,10 @@
             --badge-date: #fdf6f0; --badge-date-text: #b87a3a;
             --sidebar-bg: #fafafa;
             --sidebar-width: 260px;
+            --img-bg: #e5e5ea;
         }
         @media (prefers-color-scheme: dark) {
-            :root { --bg: #1c1c1e; --card-bg: #2c2c2e; --text: #f5f5f7; --text-secondary: #a1a1a6; --border: #3a3a3c; --accent: #4da6ff; --tag-bg: #3a3a3c; --badge-folder: #1e2a45; --badge-folder-text: #8aadff; --badge-size: #1a3028; --badge-size-text: #5ec48a; --badge-date: #2e2418; --badge-date-text: #d4a05a; --sidebar-bg: #252528; }
+            :root { --bg: #1c1c1e; --card-bg: #2c2c2e; --text: #f5f5f7; --text-secondary: #a1a1a6; --border: #3a3a3c; --accent: #4da6ff; --tag-bg: #3a3a3c; --badge-folder: #1e2a45; --badge-folder-text: #8aadff; --badge-size: #1a3028; --badge-size-text: #5ec48a; --badge-date: #2e2418; --badge-date-text: #d4a05a; --sidebar-bg: #252528; --img-bg: #232326; }
         }
         * { margin:0; padding:0; box-sizing:border-box; }
         html, body { height: 100%; overflow: hidden; }
@@ -86,19 +87,23 @@
         .image-card {
             background:var(--card-bg); border-radius:12px; overflow:hidden;
             border:1px solid var(--border); box-shadow:var(--shadow); cursor:pointer;
-            transition:transform 0.2s, box-shadow 0.2s; display:flex; flex-direction:column;
+            display:flex; flex-direction:column;
             position:absolute;
-            transform: translate3d(var(--card-x, 0px), var(--card-y, 0px), 0);
-            will-change: transform;
+            left: var(--card-x, 0px);
+            top: var(--card-y, 0px);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
-        .image-card:hover { transform:translate3d(var(--card-x, 0px), var(--card-y, 0px), 0) translateY(-3px); box-shadow:var(--shadow-hover); }
+        .image-card:hover {
+            transform: translateY(-3px);
+            box-shadow:var(--shadow-hover);
+        }
         .img-container {
-            width:100%; aspect-ratio:4/3; background:#e0e0e5;
+            width:100%; aspect-ratio:4/3; background:var(--img-bg);
             position:relative; overflow:hidden;
         }
         .img-container img {
             width:100%; height:100%; object-fit:cover; display:block;
-            opacity:0; transition: opacity 0.3s;
+            opacity:0;
         }
         .img-container img.loaded { opacity:1; }
         
@@ -106,7 +111,7 @@
         .img-loading-placeholder {
             position: absolute;
             inset: 0;
-            background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+            background: linear-gradient(90deg, var(--img-bg) 25%, var(--border) 50%, var(--img-bg) 75%);
             background-size: 200% 100%;
             animation: loading-shimmer 1.5s infinite;
         }
@@ -114,13 +119,6 @@
         @keyframes loading-shimmer {
             0% { background-position: 200% 0; }
             100% { background-position: -200% 0; }
-        }
-        
-        @media (prefers-color-scheme: dark) {
-            .img-loading-placeholder {
-                background: linear-gradient(90deg, #3a3a3c 25%, #2c2c2e 50%, #3a3a3c 75%);
-                background-size: 200% 100%;
-            }
         }
         
         .card-info { padding:6px 10px 10px; display:flex; flex-direction:column; gap:3px; }
@@ -325,16 +323,17 @@
             let displayRevision = 0;
             const imageExtensions = new Set(['jpg','jpeg','png','gif','webp','bmp','svg','tiff','tif','avif','ico','heic','heif','jfif']);
             
-            const DEFAULT_ROW_HEIGHT = 260;
-            let rowHeight = DEFAULT_ROW_HEIGHT;
-            let cardExtraHeight = null;
+            const CARD_INFO_HEIGHT = 74;
+            let rowHeight = 260;
             let columnCount = 4;
             let containerWidth = 0;
             let gap = 12;
             
-            let loadingBatchTimers = [];
             let loadGeneration = 0;
             let isScrolling = false;
+            let isFastScrolling = false;
+            let lastScrollTop = 0;
+            let lastScrollTime = 0;
             let scrollPauseTimer = null;
             
             let renderedStartIndex = 0;
@@ -345,6 +344,14 @@
             let ticking = false;
             let currentScale = 1;
             let currentSort = 'date-desc';
+
+            function getReadyImageUrl(imgData) {
+                if (!imgData) return null;
+                if (isLargeImageData(imgData)) {
+                    return thumbnailCache.get(getThumbnailCacheKey(imgData)) || ((imgData.url && imgData.url.startsWith('blob:')) ? imgData.url : null);
+                }
+                return (imgData.url && imgData.url.startsWith('blob:')) ? imgData.url : null;
+            }
             
             let panX = 0;
             let panY = 0;
@@ -363,21 +370,15 @@
             let resizeDebounceTimer = null;
 
             const CONFIG = {
-                VIEWPORT_BUFFER: 200,
-                ROW_OVERSCAN: 3,
+                ROW_OVERSCAN: 6,
                 SCROLL_STOP_DELAY: 50,
                 SWIPE_THRESHOLD: 50,
                 SEARCH_DEBOUNCE: 300,
-                MIN_BATCH: 1,
-                MAX_BATCH: 20,
-                HALF_SIZE: 1 * 1024 * 1024,
-                BATCH_INTERVAL: 100,
                 THUMBNAIL_SIZE_THRESHOLD: 500 * 1024,
                 THUMBNAIL_MAX_WIDTH: 400,
                 THUMBNAIL_MAX_HEIGHT: 300,
                 THUMBNAIL_QUALITY: 0.8,
-                LRU_CACHE_MAX_SIZE: 200,
-                MAX_RETAINED_CARDS: 500,
+                LRU_CACHE_MAX_SIZE: 1000,
                 LOG_LEVEL: 'warn', // 'debug' | 'info' | 'warn' | 'error' | 'none'
             };
 
@@ -571,28 +572,25 @@
                 }
             }
 
-            // 调度一个缩略图生成任务。
-            // 当前实现不创建新线程，只是把任务放入 Promise 并发队列中。
-            function scheduleThumbnailTask(task) {
+            // 调度一个缩略图生成任务（绑定对应 imgElement 用于视口感知和划出剔除）。
+            function scheduleThumbnailTask(imgElement, task) {
                 return new Promise((resolve, reject) => {
-                    thumbnailTaskQueue.push({ task, resolve, reject });
-                    processThumbnailTaskQueue();
+                    thumbnailTaskQueue.push({ imgElement, task, resolve, reject });
+                    dispatchThumbnailTasks();
                 });
             }
 
             // 清空尚未开始执行的缩略图任务。
-            // 已经开始执行的任务不会被强行中断，只能依赖 loadGeneration 防止旧结果写回。
             function clearThumbnailTaskQueue(reason = 'cancelled') {
                 const pending = thumbnailTaskQueue.splice(0);
-                pending.forEach(({ reject }) => {
+                pending.forEach(({ imgElement, reject }) => {
+                    if (imgElement) resetImageLoadState(imgElement);
                     try { reject(new Error(reason)); } catch (e) {}
                 });
             }
 
             function clearImageLoadQueue() {
                 loadGeneration++;
-
-                clearPendingImageBatchTimers();
 
                 clearThumbnailTaskQueue('image load queue cleared');
 
@@ -601,32 +599,12 @@
                 });
             }
 
-            function releaseScheduledBatch(batch) {
-                batch.forEach(({ element }) => {
-                    if (isScheduledAs(element, 'small')) {
-                        resetImageLoadState(element, false);
-                    }
-                });
-            }
-
-            function getImageScheduledType(imgElement) {
-                return imgElement.dataset.scheduled || '';
-            }
-
             function isImageScheduled(imgElement) {
-                return !!getImageScheduledType(imgElement);
-            }
-
-            function isScheduledAs(imgElement, type) {
-                return getImageScheduledType(imgElement) === type;
+                return !!imgElement.dataset.scheduled;
             }
 
             function markImageScheduled(img, type) {
-                img.dataset.scheduled = type;
-            }
-
-            function markImageTaskScheduled(task) {
-                markImageScheduled(task.element, task.type);
+                img.dataset.scheduled = type || '1';
             }
 
             function resetImageLoadState(img, clearSrc = false) {
@@ -651,29 +629,57 @@
                 });
             }
 
-            // 按最大并发数执行缩略图任务队列。
-            // 注意：这里限制的是任务并发数，不代表真正的多线程。
-            async function processThumbnailTaskQueue() {
-                // 如果已达到最大并发任务数或队列为空，等待
-                if (activeThumbnailTasks >= MAX_CONCURRENT_THUMBNAIL_TASKS || thumbnailTaskQueue.length === 0) {
-                    return;
+            // 派发缩略图任务：只要有空余槽位，就尽可能启动新的活跃任务
+            function dispatchThumbnailTasks() {
+                while (activeThumbnailTasks < MAX_CONCURRENT_THUMBNAIL_TASKS && thumbnailTaskQueue.length > 0) {
+                    const started = startNextThumbnailTask();
+                    if (!started) break;
                 }
-                
-                const { task, resolve, reject } = thumbnailTaskQueue.shift();
-                activeThumbnailTasks++;
-                
-                try {
-                    const result = await withTimeout(task(), 12000, 'Thumbnail generation timed out');
-                    resolve(result);
-                } catch (err) {
-                    reject(err);
-                } finally {
-                    activeThumbnailTasks--;
-                    // 继续处理下一个任务
-                    if (thumbnailTaskQueue.length > 0) {
-                        setTimeout(processThumbnailTaskQueue, 0);
+            }
+
+            // 视口优先与划出淘汰的核心调度：
+            // 1. 逆序扫描队列（LIFO：用户当前眼前最新的卡片最先被处理）
+            // 2. 划出即淘汰：处于 card-hidden 或离架的任务直接丢弃，不执行昂贵压缩
+            function startNextThumbnailTask() {
+                if (activeThumbnailTasks >= MAX_CONCURRENT_THUMBNAIL_TASKS || thumbnailTaskQueue.length === 0) {
+                    return false;
+                }
+
+                // 1. 划出即淘汰：清理所有已离架的无效任务
+                for (let i = thumbnailTaskQueue.length - 1; i >= 0; i--) {
+                    const item = thumbnailTaskQueue[i];
+                    const isOffscreen = !item.imgElement || !item.imgElement.isConnected;
+
+                    if (isOffscreen) {
+                        thumbnailTaskQueue.splice(i, 1);
+                        if (item.imgElement) {
+                            resetImageLoadState(item.imgElement);
+                        }
+                        item.resolve(null);
                     }
                 }
+
+                if (thumbnailTaskQueue.length === 0) {
+                    return false;
+                }
+
+                // 2. FIFO 提取：用户当前眼前视口按自然阅读顺序（从上至下、从左至右）顺序加载呈现
+                const { task, resolve, reject } = thumbnailTaskQueue.shift();
+                activeThumbnailTasks++;
+
+                (async () => {
+                    try {
+                        const result = await withTimeout(task(), 12000, 'Thumbnail generation timed out');
+                        resolve(result);
+                    } catch (err) {
+                        reject(err);
+                    } finally {
+                        activeThumbnailTasks--;
+                        dispatchThumbnailTasks();
+                    }
+                })();
+
+                return true;
             }
 
             function cleanupAllResources() {
@@ -695,6 +701,7 @@
                 }
 
                 isScrolling = false;
+                isFastScrolling = false;
                 cleanupObjectUrls();
                 thumbnailCache.clear();
             }
@@ -703,11 +710,6 @@
             // 01. 核心配置与运行状态（续）
             // 继续放置批次计算、格式化、转义和路径规范化等基础工具函数。
             // ============================================================
-            // 动态批次大小计算（指数衰减策略）
-            function getBatchSize(fileSize) {
-                return Math.max(CONFIG.MIN_BATCH, Math.round(CONFIG.MAX_BATCH * Math.exp(-fileSize / CONFIG.HALF_SIZE)));
-            }
-
             function formatDate(ms) {
                 if(!ms) return '';
                 const d=new Date(ms);
@@ -722,14 +724,6 @@
                     .replace(/'/g, '&#39;');
             }
             
-            function isInViewport(imgElement) {
-                if (!imgElement.isConnected) return false;
-                const rect = imgElement.getBoundingClientRect();
-                const viewHeight = window.innerHeight || document.documentElement.clientHeight;
-                // 判断图片是否与扩展后的视口相交
-                return rect.bottom >= -CONFIG.VIEWPORT_BUFFER && rect.top <= viewHeight + CONFIG.VIEWPORT_BUFFER;
-            }
-
             function showToast(msg){
                 toast.textContent=msg; toast.classList.add('show');
                 clearTimeout(window._toastTimer);
@@ -1198,41 +1192,12 @@
                 return (containerWidth - gap * (columnCount - 1)) / columnCount;
             }
 
-            function calculateRowHeightFromCache() {
-                if (cardExtraHeight === null) return DEFAULT_ROW_HEIGHT;
-                const colWidth = getCardColumnWidth();
-                return colWidth * 0.75 + cardExtraHeight;
-            }
-
-            function measureRowHeight() {
-                if (cardExtraHeight !== null) {
-                    return calculateRowHeightFromCache();
-                }
-
-                const tempCard = createCardElement({ url: '', name: '测量用', folder: '测试', size: 1024, modified: Date.now() }, 0);
-                tempCard.style.position = 'fixed';
-                tempCard.style.visibility = 'hidden';
-                tempCard.style.left = '0';
-                tempCard.style.top = '0';
-                const colWidth = getCardColumnWidth();
-                tempCard.style.width = colWidth + 'px';
-                document.body.appendChild(tempCard);
-                const height = tempCard.getBoundingClientRect().height;
-                const imageHeight = tempCard.querySelector('.img-container')?.getBoundingClientRect().height || colWidth * 0.75;
-                document.body.removeChild(tempCard);
-                cardExtraHeight = Math.max(0, (height || DEFAULT_ROW_HEIGHT) - imageHeight);
-                return height || calculateRowHeightFromCache();
-            }
-
             function updateLayoutParams() {
-                const oldWidth = containerWidth;
                 containerWidth = scrollContainer.clientWidth;
                 if (containerWidth <= 0) return;
                 const minColWidth = 180;
                 columnCount = Math.max(1, Math.floor((containerWidth + gap) / (minColWidth + gap)));
-                if (containerWidth !== oldWidth || cardExtraHeight === null) {
-                    rowHeight = measureRowHeight();
-                }
+                rowHeight = Math.round(getCardColumnWidth() * 0.75 + CARD_INFO_HEIGHT);
             }
 
             function getTotalHeight() {
@@ -1286,28 +1251,19 @@
                         card.style.setProperty('--card-y', top + 'px');
                         visibleContent.appendChild(card);
                     } else {
-                        card.style.display = '';
+                        card.style.width = colWidth + 'px';
                         card.style.setProperty('--card-x', left + 'px');
                         card.style.setProperty('--card-y', top + 'px');
                         card.dataset.index = i;
                     }
-                    card.dataset.lastVisibleAt = String(now);
                 }
                 
                 existingCards.forEach(card => {
-                    if (!newVisibleIds.has(card.dataset.imageId)) {
-                        card.style.display = 'none';
+                    const imageId = card.dataset.imageId;
+                    if (!newVisibleIds.has(imageId)) {
+                        card.remove();
                     }
                 });
-
-                const retainedCards = Array.from(visibleContent.children);
-                if (retainedCards.length > CONFIG.MAX_RETAINED_CARDS) {
-                    const hiddenCards = retainedCards
-                        .filter(card => card.style.display === 'none')
-                        .sort((a, b) => Number(a.dataset.lastVisibleAt || 0) - Number(b.dataset.lastVisibleAt || 0));
-                    const removeCount = retainedCards.length - CONFIG.MAX_RETAINED_CARDS;
-                    hiddenCards.slice(0, removeCount).forEach(card => card.remove());
-                }
                 
                 scrollPlaceholder.style.height = getTotalHeight() + 'px';
             }
@@ -1325,14 +1281,19 @@
                 const imageEl = document.createElement('img');
                 imageEl.dataset.src = imageId;
                 imageEl.alt = img.name;
-                imageEl.setAttribute('decoding', 'async');
-                imageEl.setAttribute('loading', 'lazy');
                 imageEl.style.width = '100%';
                 imageEl.style.height = '100%';
                 
-                const placeholder = document.createElement('div');
-                placeholder.className = 'img-loading-placeholder';
-                imgContainer.appendChild(placeholder);
+                const readyUrl = getReadyImageUrl(img);
+                if (readyUrl) {
+                    // 瞬时命中：内存已有图片，直接呈现，不创建骨架屏，彻底消灭闪烁
+                    imageEl.src = readyUrl;
+                    imageEl.classList.add('loaded');
+                } else {
+                    const placeholder = document.createElement('div');
+                    placeholder.className = 'img-loading-placeholder';
+                    imgContainer.appendChild(placeholder);
+                }
                 imgContainer.appendChild(imageEl);
                 
                 const info = document.createElement('div');
@@ -1350,137 +1311,52 @@
 
             // ============================================================
             // 05. 图片加载与缩略图任务队列
-            // 负责可见图片加载、小图直显、大图缩略图生成、加载批次和缩略图任务调度。
+            // 负责可见图片加载、小图直显、大图缩略图生成与任务调度。
             // ============================================================
-            // 当前仍保留“小图 batch 加载、大图非滚动时加载”的策略。
-            // small / large 任务结构已统一，但调度策略仍保持分离，以避免改变性能特征。
-            //
-            // 图片加载任务结构：
-            // {
-            //     element: HTMLImageElement,
-            //     data: 图片元数据,
-            //     type: 'small' | 'large'
-            // }
-            // small 任务走小图 batch 加载。
-            // large 任务在非滚动状态下直接进入 loadImageWithPlaceholder()，并在内部生成缩略图。
-            //
-            // scheduled 状态保存在 img.dataset.scheduled 中。
-            // small 表示已进入小图 batch timer。
-            // large 表示已进入大图加载/缩略图生成流程。
             function observeVisibleImages() {
                 const generation = loadGeneration;
-
-                clearPendingImageBatchTimers();
-
-                const { smallImages, largeImages } = collectVisibleImageLoadTasks();
-
-                scheduleSmallImageBatches(smallImages, generation);
-                scheduleLargeImageTasks(largeImages, generation);
-            }
-
-            // 清理尚未执行的小图批量加载 timer。
-            // 会通过 releaseScheduledBatch() 释放 small batch 的 scheduled 标记，但不递增 loadGeneration。
-            // 该函数只处理 batch timer，不处理 thumbnailTaskQueue。
-            function clearPendingImageBatchTimers() {
-                loadingBatchTimers.forEach(({ timer, batch }) => {
-                    clearTimeout(timer);
-                    releaseScheduledBatch(batch);
-                });
-
-                loadingBatchTimers = [];
-            }
-
-            function collectVisibleImageLoadTasks() {
-                const smallImages = [];
-                const largeImages = [];
                 const imgElements = visibleContent.querySelectorAll('img[data-src]');
 
                 imgElements.forEach(img => {
                     if (
-                        !img.src &&
-                        !img.classList.contains('loaded') &&
-                        !img.classList.contains('error') &&
-                        !isImageScheduled(img) &&
-                        isInViewport(img)
+                        img.classList.contains('loaded') ||
+                        img.classList.contains('error') ||
+                        isImageScheduled(img)
                     ) {
-                        const src = img.dataset.src;
-                        const imgData = imageIndex.get(src);
+                        return;
+                    }
 
-                        if (imgData) {
-                            if (isLargeImageData(imgData)) {
-                                largeImages.push({ element: img, data: imgData, type: 'large' });
-                            } else {
-                                smallImages.push({ element: img, data: imgData, type: 'small' });
-                            }
+                    // 同步就绪检测：如果底层图片已在内存就绪，直接标为成功
+                    if (img.complete && img.naturalWidth > 0) {
+                        img.classList.add('loaded');
+                        resetImageLoadState(img);
+                        const placeholder = img.parentElement ? img.parentElement.querySelector('.img-loading-placeholder') : null;
+                        if (placeholder) placeholder.remove();
+                        return;
+                    }
+
+                    const imgData = imageIndex.get(img.dataset.src);
+                    if (!imgData) return;
+
+                    // 检查内存中是否已有现成 URL（直显命中）
+                    const readyUrl = getReadyImageUrl(imgData);
+                    if (readyUrl) {
+                        if (img.src !== readyUrl) {
+                            img.src = readyUrl;
+                        }
+                        if (img.complete && img.naturalWidth > 0) {
+                            img.classList.add('loaded');
+                            resetImageLoadState(img);
+                            const placeholder = img.parentElement ? img.parentElement.querySelector('.img-loading-placeholder') : null;
+                            if (placeholder) placeholder.remove();
+                            return;
                         }
                     }
-                });
 
-                return { smallImages, largeImages };
-            }
-
-            function scheduleSmallImageBatches(smallImages, generation) {
-                smallImages.sort((a, b) => (a.data.size || 0) - (b.data.size || 0));
-
-                let currentIndex = 0;
-                let batchDelay = 0;
-
-                while (currentIndex < smallImages.length) {
-                    const currentFileSize = smallImages[currentIndex].data.size || 0;
-                    const dynamicBatchSize = getBatchSize(currentFileSize);
-
-                    const batch = smallImages.slice(currentIndex, currentIndex + dynamicBatchSize);
-
-                    batch.forEach(markImageTaskScheduled);
-
-                    const timer = setTimeout(() => {
-                        loadBatchWithPlaceholder(batch, generation);
-                    }, batchDelay);
-                    loadingBatchTimers.push({ timer, batch });
-
-                    currentIndex += dynamicBatchSize;
-                    batchDelay += CONFIG.BATCH_INTERVAL;
-                }
-            }
-
-            function scheduleLargeImageTasks(largeImages, generation) {
-                if (!isScrolling) {
-                    largeImages.forEach(task => {
-                        markImageTaskScheduled(task);
-                        loadImageWithPlaceholder(task.element, task.data, generation).catch(err => {
-                            log('error', '[THUMB] Load failed:', task.data.name, err);
-                        });
-                    });
-                } else {
-                    if (largeImages.length > 0) {
-                        log('debug', '[PAUSE] Scroll paused, skipping', largeImages.length, 'thumbnail generation tasks');
-                    }
-                }
-            }
-            
-            // 分批加载图片并显示占位符
-            function loadBatchWithPlaceholder(batch, generation = loadGeneration) {
-                if (generation !== loadGeneration || isScrolling) {
-                    releaseScheduledBatch(batch);
-                    return;
-                }
-                
-                const validBatch = batch.filter(({ element }) => isInViewport(element));
-                const validElements = new Set(validBatch.map(({ element }) => element));
-                batch.forEach(({ element }) => {
-                    if (!validElements.has(element) && isScheduledAs(element, 'small')) {
-                        resetImageLoadState(element, false);
-                    }
-                });
-                
-                if (validBatch.length === 0) {
-                    releaseScheduledBatch(batch);
-                    return;
-                }
-                
-                validBatch.forEach(({ element, data }) => {
-                    loadImageWithPlaceholder(element, data, generation).catch(err => {
-                        log('warn', 'Individual image load failed:', err);
+                    const isLarge = isLargeImageData(imgData);
+                    markImageScheduled(img, isLarge ? 'large' : 'small');
+                    loadImageWithPlaceholder(img, imgData, generation).catch(err => {
+                        log(isLarge ? 'error' : 'warn', `[LOAD] Failed: ${imgData.name}`, err);
                     });
                 });
             }
@@ -1492,7 +1368,7 @@
 
             // 决定卡片最终展示 URL：小图使用原图 Object URL，大图优先使用缩略图 Blob URL。
             // 该函数不操作 DOM，不设置 img.src，也不处理重试和错误 UI。
-            async function resolveDisplayImageUrl(imgData, generation) {
+            async function resolveDisplayImageUrl(imgData, generation, imgElement = null) {
                 const imageUrl = await ensureImageObjectUrl(imgData);
 
                 if (generation !== loadGeneration) {
@@ -1521,12 +1397,14 @@
                 log('debug', '[THUMB] Generating thumbnail via task queue:', imgData.name);
 
                 try {
-                    const thumbnailUrl = await scheduleThumbnailTask(() =>
+                    const thumbnailUrl = await scheduleThumbnailTask(imgElement, () =>
                         atomicThumbnailTask(imageUrl)
                     );
 
-                    if (generation !== loadGeneration) {
-                        try { URL.revokeObjectURL(thumbnailUrl); } catch (e) {}
+                    if (generation !== loadGeneration || !thumbnailUrl) {
+                        if (thumbnailUrl) {
+                            try { URL.revokeObjectURL(thumbnailUrl); } catch (e) {}
+                        }
                         return null;
                     }
 
@@ -1535,35 +1413,61 @@
                     return thumbnailUrl;
                 } catch (thumbErr) {
                     log('warn', '[THUMB] Thumbnail generation failed, falling back to original:', imgData.name, thumbErr);
+                    thumbnailCache.set(thumbnailKey, imageUrl);
                     return imageUrl;
                 }
             }
 
             function waitImageElementLoaded(imgElement, imageUrl, imgData) {
                 const loadPromise = new Promise((resolve, reject) => {
+                    let done = false;
+                    const cleanup = () => {
+                        imgElement.onload = null;
+                        imgElement.onerror = null;
+                    };
+
                     imgElement.onload = () => {
+                        if (done) return;
+                        done = true;
+                        cleanup();
                         log('info', '[OK] Image loaded successfully:', imgData.name);
                         resolve();
                     };
 
                     imgElement.onerror = () => {
+                        if (done) return;
                         if (imgElement.complete && imgElement.naturalWidth > 0) {
+                            done = true;
+                            cleanup();
                             resolve();
                         } else {
+                            done = true;
+                            cleanup();
                             log('error', '[ERROR] Image load failed:', imgData.name);
                             reject(new Error('Image load failed'));
                         }
                     };
 
                     imgElement.src = imageUrl;
+                    if (imgElement.complete && imgElement.naturalWidth > 0) {
+                        done = true;
+                        cleanup();
+                        resolve();
+                    }
                 });
 
                 return withTimeout(loadPromise, 15000, 'Image load timeout: ' + (imgData ? imgData.name : ''));
             }
 
             async function loadImageWithPlaceholder(imgElement, imgData, generation = loadGeneration) {
-                if (generation !== loadGeneration) return;
-                if (!imgElement.isConnected) return;
+                if (generation !== loadGeneration) {
+                    resetImageLoadState(imgElement);
+                    return;
+                }
+                if (!imgElement.isConnected) {
+                    resetImageLoadState(imgElement);
+                    return;
+                }
                 if (imgElement.classList.contains('loaded') || imgElement.classList.contains('error')) {
                     resetImageLoadState(imgElement);
                     log('debug', '[SKIP] Already loaded or error:', imgData.name);
@@ -1573,22 +1477,36 @@
                 log('debug', '[LOAD] Starting load:', imgData.name, 'Size:', imgData.size || 0);
                 
                 try {
-                    const imageUrl = await resolveDisplayImageUrl(imgData, generation);
-                    if (generation !== loadGeneration || !imageUrl) return;
+                    const imageUrl = await resolveDisplayImageUrl(imgData, generation, imgElement);
+                    if (generation !== loadGeneration) {
+                        resetImageLoadState(imgElement);
+                        return;
+                    }
+                    if (!imageUrl) {
+                        // 任务因划出视口被取消或跳过，重置调度标记，允许回滑时再次加载
+                        resetImageLoadState(imgElement);
+                        return;
+                    }
                     
                     await waitImageElementLoaded(imgElement, imageUrl, imgData);
                     
-                    if (generation !== loadGeneration) return;
+                    if (generation !== loadGeneration) {
+                        resetImageLoadState(imgElement);
+                        return;
+                    }
 
                     // 加载成功
                     imgElement.classList.add('loaded');
                     resetImageLoadState(imgElement);
-                    const placeholder = imgElement.parentElement.querySelector('.img-loading-placeholder');
+                    const placeholder = imgElement.parentElement ? imgElement.parentElement.querySelector('.img-loading-placeholder') : null;
                     if (placeholder) placeholder.remove();
                     log('debug', '[DONE] Image processing complete:', imgData.name);
                     
                 } catch (err) {
-                    if (generation !== loadGeneration) return;
+                    if (generation !== loadGeneration) {
+                        resetImageLoadState(imgElement);
+                        return;
+                    }
                     log('error', '[EXCEPTION] Failed to load image:', imgData.name, err);
                     
                     resetImageLoadState(imgElement);
@@ -1641,6 +1559,19 @@
             }
             
             function onScroll() {
+                const now = performance.now();
+                const currentScrollTop = scrollContainer.scrollTop;
+                const dt = now - lastScrollTime;
+                
+                if (dt >= 16) {
+                    const dy = Math.abs(currentScrollTop - lastScrollTop);
+                    const velocity = (dy / dt) * 1000;
+                    // 速度超过 2500 px/s 标记为极速飞掠/拖拽滚动条
+                    isFastScrolling = velocity > 2500;
+                    lastScrollTop = currentScrollTop;
+                    lastScrollTime = now;
+                }
+
                 isScrolling = true;
                 
                 if (scrollPauseTimer) {
@@ -1649,15 +1580,20 @@
                 
                 scrollPauseTimer = setTimeout(() => {
                     isScrolling = false;
+                    isFastScrolling = false;
+                    renderVisibleItems();
                     observeVisibleImages();
                     if (thumbnailTaskQueue.length > 0) {
-                        processThumbnailTaskQueue();
+                        dispatchThumbnailTasks();
                     }
                 }, CONFIG.SCROLL_STOP_DELAY);
                 
                 if (!ticking) {
                     requestAnimationFrame(() => {
                         renderVisibleItems();
+                        if (!isFastScrolling) {
+                            observeVisibleImages();
+                        }
                         ticking = false;
                     });
                     ticking = true;
