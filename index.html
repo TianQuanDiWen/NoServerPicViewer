@@ -108,6 +108,18 @@
         .img-container img.loaded { opacity:1; }
         
         /* 图片加载动画 */
+                .img-loading-placeholder.error {
+            animation: none;
+            background: var(--img-bg);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            cursor: pointer;
+            padding: 8px;
+            text-align: center;
+        }
         .img-loading-placeholder {
             position: absolute;
             inset: 0;
@@ -309,11 +321,6 @@
                     });
                 }
             };
-
-            // ============================================================
-            // 01. 核心配置与运行状态（续）
-            // 继续放置全局状态变量、CONFIG 配置和基础工具函数。
-            // ============================================================
             let allImages = [];
             let folderTree = null;
             let activeFolder = null;
@@ -345,10 +352,8 @@
 
             function getReadyImageUrl(imgData) {
                 if (!imgData) return null;
-                if (isLargeImageData(imgData)) {
-                    return thumbnailCache.get(getThumbnailCacheKey(imgData)) || ((imgData.url && imgData.url.startsWith('blob:')) ? imgData.url : null);
-                }
-                return (imgData.url && imgData.url.startsWith('blob:')) ? imgData.url : null;
+                const directUrl = (imgData.url && imgData.url.startsWith('blob:')) ? imgData.url : null;
+                return (isLargeImageData(imgData) ? thumbnailCache.get(getImageId(imgData)) : null) || directUrl;
             }
             
             let panX = 0;
@@ -372,11 +377,16 @@
                 SCROLL_STOP_DELAY: 50,
                 SWIPE_THRESHOLD: 50,
                 SEARCH_DEBOUNCE: 300,
+                GRID_MIN_COL_WIDTH: 180,
+                MAX_CONCURRENT_THUMBNAIL_TASKS: 3,
+                THUMBNAIL_TASK_TIMEOUT: 12000,
                 THUMBNAIL_SIZE_THRESHOLD: 500 * 1024,
                 THUMBNAIL_MAX_WIDTH: 400,
                 THUMBNAIL_MAX_HEIGHT: 300,
                 THUMBNAIL_QUALITY: 0.8,
                 LRU_CACHE_MAX_SIZE: 1000,
+                IMAGE_LOAD_TIMEOUT: 15000,
+                LIGHTBOX_LOAD_TIMEOUT: 10000,
                 LOG_LEVEL: 'warn', // 'debug' | 'info' | 'warn' | 'error' | 'none'
             };
 
@@ -394,11 +404,6 @@
                     );
                 }
             }
-
-            // ============================================================
-            // 02. 本地存储、资源管理与缓存（续）
-            // 继续放置缩略图缓存和资源生命周期管理。
-            // ============================================================
             // 缩略图缓存只负责缩略图 Blob URL 的生命周期。
             // 原图 Object URL 不归该缓存管理。
             // 缩略图缓存 key 当前使用图片稳定 ID，而不是图片 URL。
@@ -453,11 +458,6 @@
             }
 
             const thumbnailCache = new ThumbnailLRUCache(CONFIG.LRU_CACHE_MAX_SIZE);
-
-            // ============================================================
-            // 01. 核心配置与运行状态（续）
-            // 继续放置基础格式化工具函数。
-            // ============================================================
             function withTimeout(promise, ms = 10000, errorMsg = 'Operation timed out') {
                 let timer;
                 const timeoutPromise = new Promise((_, reject) => {
@@ -472,11 +472,19 @@
                 while(bytes>=1024 && i<3){bytes/=1024;i++;}
                 return bytes.toFixed(i?1:0)+' '+u[i];
             }
-            
-            // ============================================================
-            // 02. 本地存储、资源管理与缓存（续）
-            // 继续放置 Object URL 清理和缩略图任务队列的资源管理说明。
-            // ============================================================
+
+            function updateStatsDisplay(images) {
+                const folders = new Set();
+                let totalSize = 0;
+                for (let i = 0; i < images.length; i++) {
+                    const img = images[i];
+                    folders.add(normalizePath(img.folder || '') || '__root__');
+                    totalSize += img.size || 0;
+                }
+                statImages.textContent = images.length;
+                statFolders.textContent = folders.size;
+                statSize.textContent = formatSize(totalSize);
+            }
             // 资源边界：
             // 原图 Object URL 由 ensureImageObjectUrl 创建，存入 imgData.url，并由 objectUrlSet 跟踪。
             // 原图 Object URL 由 cleanupObjectUrls / revokeObjectUrl 释放。
@@ -504,11 +512,11 @@
             // MAX_CONCURRENT_THUMBNAIL_TASKS 表示允许同时执行的缩略图生成任务上限。
             // thumbnailTaskQueue 表示等待执行的缩略图任务队列。
             let activeThumbnailTasks = 0;
-            const MAX_CONCURRENT_THUMBNAIL_TASKS = 3;
+            const MAX_CONCURRENT_THUMBNAIL_TASKS = CONFIG.MAX_CONCURRENT_THUMBNAIL_TASKS;
             let thumbnailTaskQueue = [];
 
             // 从源对象解析可用于解码的 Blob（支持 File, Blob, FileSystemFileHandle, 或 blob URL）
-            async function resolveBlobFromSource(source, fallbackUrl) {
+            async function resolveBlobFromSource(source) {
                 if (source instanceof Blob) return source;
                 if (source && typeof source.getFile === 'function') {
                     try { return await source.getFile(); } catch (e) {}
@@ -519,8 +527,8 @@
                 if (source && source.file instanceof Blob) {
                     return source.file;
                 }
-                const url = (typeof source === 'string' && source) || fallbackUrl;
-                if (url && typeof url === 'string') {
+                const url = typeof source === 'string' ? source : null;
+                if (url) {
                     const resp = await fetch(url);
                     return await resp.blob();
                 }
@@ -571,8 +579,8 @@
             }
 
             // 原子化任务：解析 Blob → 原生硬件缩放 → 返回缩略图URL
-            async function atomicThumbnailTask(source, imageUrl) {
-                const blob = await resolveBlobFromSource(source, imageUrl);
+            async function atomicThumbnailTask(source) {
+                const blob = await resolveBlobFromSource(source);
                 return await generateThumbnailFromBlob(
                     blob,
                     CONFIG.THUMBNAIL_MAX_WIDTH,
@@ -677,7 +685,7 @@
 
                 (async () => {
                     try {
-                        const result = await withTimeout(task(), 12000, 'Thumbnail generation timed out');
+                        const result = await withTimeout(task(), CONFIG.THUMBNAIL_TASK_TIMEOUT, 'Thumbnail generation timed out');
                         resolve(result);
                     } catch (err) {
                         reject(err);
@@ -713,11 +721,6 @@
                 cleanupObjectUrls();
                 thumbnailCache.clear();
             }
-            
-            // ============================================================
-            // 01. 核心配置与运行状态（续）
-            // 继续放置批次计算、格式化、转义和路径规范化等基础工具函数。
-            // ============================================================
             function formatDate(ms) {
                 if(!ms) return '';
                 const d=new Date(ms);
@@ -780,23 +783,12 @@
                 return img.id;
             }
 
-            // 缩略图缓存 key：当前使用图片稳定 ID。
-            // 该 ID 由路径、文件名、大小、修改时间组成，文件变化后会自动生成新的缓存 key。
-            function getThumbnailCacheKey(imgData) {
-                return getImageId(imgData);
-            }
-
             function rebuildImageIndex() {
                 imageIndex.clear();
                 for (const img of currentDisplayImages) {
                     imageIndex.set(getImageId(img), img);
                 }
             }
-
-            // ============================================================
-            // 02. 本地存储、资源管理与缓存（续）
-            // 继续放置原图 Object URL 的创建、复用和释放。
-            // ============================================================
             // 原图 Object URL 管理：
             // ensureImageObjectUrl 只负责为原始文件创建和复用 Object URL。
             // 不在这里创建缩略图 URL，也不管理 thumbnailCache。
@@ -836,7 +828,7 @@
                 if (!imgData.url) return;
                 try { URL.revokeObjectURL(imgData.url); } catch (e) {}
                 objectUrlSet.delete(imgData.url);
-                thumbnailCache.delete(getThumbnailCacheKey(imgData));
+                thumbnailCache.delete(getImageId(imgData));
                 imgData.url = null;
             }
 
@@ -1176,7 +1168,7 @@
             function updateLayoutParams() {
                 containerWidth = scrollContainer.clientWidth;
                 if (containerWidth <= 0) return;
-                const minColWidth = 180;
+                const minColWidth = CONFIG.GRID_MIN_COL_WIDTH;
                 columnCount = Math.max(1, Math.floor((containerWidth + gap) / (minColWidth + gap)));
                 rowHeight = Math.round(getCardColumnWidth() * 0.75 + CARD_INFO_HEIGHT);
             }
@@ -1367,7 +1359,7 @@
 
                 log('debug', '[THUMB] Processing large image:', imgData.name);
 
-                const thumbnailKey = getThumbnailCacheKey(imgData);
+                const thumbnailKey = getImageId(imgData);
                 const cachedThumbnail = thumbnailCache.get(thumbnailKey);
 
                 if (cachedThumbnail) {
@@ -1448,7 +1440,7 @@
                     }
                 });
 
-                return withTimeout(loadPromise, 15000, 'Image load timeout: ' + (imgData ? imgData.name : ''));
+                return withTimeout(loadPromise, CONFIG.IMAGE_LOAD_TIMEOUT, 'Image load timeout: ' + (imgData ? imgData.name : ''));
             }
 
             async function loadImageWithPlaceholder(imgElement, imgData, generation = loadGeneration) {
@@ -1521,17 +1513,15 @@
                 let placeholder = container.querySelector('.img-loading-placeholder');
                 if (!placeholder) {
                     placeholder = document.createElement('div');
-                    placeholder.className = 'img-loading-placeholder error';
                     container.appendChild(placeholder);
                 }
-                placeholder.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;font-size:0.8rem;cursor:pointer;padding:8px;text-align:center;" title="点击重试">${escapeHtml(message)}</div>`;
-                placeholder.classList.add('error');
-                if (onClick) {
-                    placeholder.querySelector('div').onclick = event => {
-                        event.stopPropagation();
-                        onClick();
-                    };
-                }
+                placeholder.className = 'img-loading-placeholder error';
+                placeholder.textContent = message;
+                placeholder.title = '点击重试';
+                placeholder.onclick = onClick ? (event) => {
+                    event.stopPropagation();
+                    onClick();
+                } : null;
             }
 
             function showRetryState(imgElement) {
@@ -1541,8 +1531,9 @@
                 if (!container) return;
                 const placeholder = container.querySelector('.img-loading-placeholder');
                 if (placeholder) {
-                    placeholder.classList.remove('error');
-                    placeholder.innerHTML = '';
+                    placeholder.className = 'img-loading-placeholder';
+                    placeholder.textContent = '';
+                    placeholder.onclick = null;
                 } else {
                     const newPlaceholder = document.createElement('div');
                     newPlaceholder.className = 'img-loading-placeholder';
@@ -1616,18 +1607,7 @@
                 currentDisplayImages = filtered;
                 rebuildImageIndex();
                 displayRevision++;
-                statImages.textContent = filtered.length;
-                
-                // 优化统计计算：避免重复创建 Set，使用更高效的计算方式
-                const folderSet = new Set();
-                let totalSize = 0;
-                for (let i = 0; i < filtered.length; i++) {
-                    const img = filtered[i];
-                    folderSet.add(normalizePath(img.folder || '根目录'));
-                    totalSize += img.size || 0;
-                }
-                statFolders.textContent = folderSet.size;
-                statSize.textContent = formatSize(totalSize);
+                updateStatsDisplay(filtered);
                 
                 document.querySelectorAll('.tree-item').forEach(el => el.classList.remove('active'));
                 
@@ -1678,7 +1658,7 @@
                 const img = list[idx];
                 let url;
                 try {
-                    url = await withTimeout(ensureImageObjectUrl(img), 10000, '读取图片超时');
+                    url = await withTimeout(ensureImageObjectUrl(img), CONFIG.LIGHTBOX_LOAD_TIMEOUT, '读取图片超时');
                 } catch (err) {
                     if (token === lightboxOpenToken) {
                         showToast('❌ 无法读取图片：' + err.message);
@@ -1693,10 +1673,13 @@
                 resetZoom();
             }
 
-            function closeLightbox(){ 
+            function closeLightbox() { 
+                if (document.fullscreenElement) {
+                    try { document.exitFullscreen(); } catch (e) {}
+                }
                 lightboxOpenToken++;
-                lightbox.style.display='none'; 
-                lightboxImg.src=''; 
+                lightbox.style.display = 'none'; 
+                lightboxImg.src = ''; 
                 resetZoom();
                 currentLightboxList = [];
                 currentIndex = -1;
@@ -1880,16 +1863,22 @@
             }
 
             // 事件绑定
-            lightboxClose.addEventListener('click', closeLightbox);
-            lightboxPrev.addEventListener('click', (e)=>{e.stopPropagation(); navLightbox(-1);});
-            lightboxNext.addEventListener('click', (e)=>{e.stopPropagation(); navLightbox(1);});
-            lightbox.addEventListener('click', function(e){ if(e.target===lightbox) closeLightbox(); });
-            
-            lightboxZoomIn.addEventListener('click', (e)=>{e.stopPropagation(); zoomIn();});
-            lightboxZoomOut.addEventListener('click', (e)=>{e.stopPropagation(); zoomOut();});
-            lightboxReset.addEventListener('click', (e)=>{e.stopPropagation(); resetZoom();});
-            lightboxFullscreen.addEventListener('click', (e)=>{e.stopPropagation(); toggleFullscreen();});
-            lightboxCopy.addEventListener('click', (e)=>{e.stopPropagation(); copyImageToClipboard();});
+            lightbox.addEventListener('click', (e) => {
+                if (e.target === lightbox || e.target.closest('#lightboxClose')) {
+                    closeLightbox();
+                    return;
+                }
+                const btn = e.target.closest('button');
+                if (!btn) return;
+                e.stopPropagation();
+                if (btn === lightboxPrev) navLightbox(-1);
+                else if (btn === lightboxNext) navLightbox(1);
+                else if (btn === lightboxZoomIn) zoomIn();
+                else if (btn === lightboxZoomOut) zoomOut();
+                else if (btn === lightboxReset) resetZoom();
+                else if (btn === lightboxFullscreen) toggleFullscreen();
+                else if (btn === lightboxCopy) copyImageToClipboard();
+            });
 
             lightboxImgWrapper.addEventListener('wheel', (e) => {
                 e.preventDefault();
@@ -1959,36 +1948,9 @@
                 }, CONFIG.SEARCH_DEBOUNCE);
             });
 
-            function collectTreePaths(node, paths = new Set()) {
-                if (!node) return paths;
-                paths.add(node.path);
-                Object.values(node.children).forEach(child => collectTreePaths(child, paths));
-                return paths;
-            }
-
-            function refreshFolderTreeSilently() {
-                const nextTree = buildFolderTree(allImages, currentRootFolder);
-                const expanded = getExpandedFolderPaths();
-                const oldPaths = collectTreePaths(folderTree);
-                const nextPaths = collectTreePaths(nextTree);
-                const sameStructure = !!folderTree && oldPaths.size === nextPaths.size &&
-                    [...oldPaths].every(path => nextPaths.has(path));
-
-                if (!sameStructure) {
-                    folderTree = nextTree;
-                    renderTree(expanded);
-                    return;
-                }
-
-                function applyNodeMetadata(currentNode, nextNode) {
-                    currentNode.totalImages = nextNode.totalImages;
-                    currentNode._handle = nextNode._handle;
-                    if (currentNode._countEl) currentNode._countEl.textContent = nextNode.totalImages;
-                    Object.keys(currentNode.children).forEach(name => {
-                        applyNodeMetadata(currentNode.children[name], nextNode.children[name]);
-                    });
-                }
-                applyNodeMetadata(folderTree, nextTree);
+            function rebuildAndRenderTree(expandedPaths = null) {
+                folderTree = buildFolderTree(allImages, currentRootFolder);
+                renderTree(expandedPaths || getExpandedFolderPaths());
             }
 
             function pathsOverlap(pathA, pathB) {
@@ -2080,10 +2042,8 @@
                 sidebar.classList.remove('open');
                 overlay.style.display = 'none';
                 updateSidebarToggleIcon();
-
                 let displayedScanSize = 0;
-                let displayedScanFolders = new Set();
-                let previewDisplayRevision = displayRevision;
+                const displayedScanFolders = new Set();
                 const dirtyCountNodes = new Set();
                 let previewTimer = null;
                 let lastPreviewAt = 0;
@@ -2094,15 +2054,6 @@
                         if (node._countEl) node._countEl.textContent = node.totalImages;
                     });
                     dirtyCountNodes.clear();
-                    if (previewDisplayRevision !== displayRevision) {
-                        displayedScanSize = 0;
-                        displayedScanFolders = new Set();
-                        for (const image of currentDisplayImages) {
-                            displayedScanSize += image.size || 0;
-                            displayedScanFolders.add(normalizePath(image.folder || '') || '__root__');
-                        }
-                        previewDisplayRevision = displayRevision;
-                    }
                     statImages.textContent = currentDisplayImages.length;
                     statFolders.textContent = displayedScanFolders.size;
                     statSize.textContent = formatSize(displayedScanSize);
@@ -2259,7 +2210,7 @@
                 if (currentGen !== scanGeneration) return false;
                 if (removeSet.size) allImages = allImages.filter(img => !removeSet.has(img));
                 if (additions.length) allImages.push(...additions);
-                refreshFolderTreeSilently();
+                rebuildAndRenderTree();
 
                 if (activeFolder !== null && pathsOverlap(activeFolder, normalizedTarget)) {
                     updateDisplay();
