@@ -360,6 +360,7 @@
             let currentRootDirHandle = null;
             let folderHandleMap = new Map();
             let saveUISettingsTimer = null;
+            let resizeDebounceTimer = null;
 
             const CONFIG = {
                 VIEWPORT_BUFFER: 200,
@@ -377,7 +378,6 @@
                 THUMBNAIL_QUALITY: 0.8,
                 LRU_CACHE_MAX_SIZE: 200,
                 MAX_RETAINED_CARDS: 500,
-                IMAGE_LOAD_STALE_TIMEOUT: 20000,
                 LOG_LEVEL: 'warn', // 'debug' | 'info' | 'warn' | 'error' | 'none'
             };
 
@@ -424,8 +424,6 @@
                     if (this.cache.size > this.maxSize) this.evict();
                 }
                 
-                has(cacheKey) { return this.cache.has(cacheKey); }
-                
                 delete(cacheKey) {
                     if (this.cache.has(cacheKey)) {
                         const item = this.cache.get(cacheKey);
@@ -451,8 +449,6 @@
                     }
                     if (oldestKey) this.delete(oldestKey);
                 }
-                
-                get size() { return this.cache.size; }
             }
 
             const thumbnailCache = new ThumbnailLRUCache(CONFIG.LRU_CACHE_MAX_SIZE);
@@ -461,6 +457,14 @@
             // 01. 核心配置与运行状态（续）
             // 继续放置基础格式化工具函数。
             // ============================================================
+            function withTimeout(promise, ms = 10000, errorMsg = 'Operation timed out') {
+                let timer;
+                const timeoutPromise = new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(new Error(errorMsg)), ms);
+                });
+                return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+            }
+
             function formatSize(bytes) {
                 if (!bytes) return '0 B';
                 const u = ['B','KB','MB','GB']; let i=0;
@@ -619,7 +623,6 @@
 
             function markImageScheduled(img, type) {
                 img.dataset.scheduled = type;
-                img.dataset.scheduledAt = String(Date.now());
             }
 
             function markImageTaskScheduled(task) {
@@ -628,24 +631,9 @@
 
             function resetImageLoadState(img, clearSrc = false) {
                 delete img.dataset.scheduled;
-                delete img.dataset.scheduledAt;
-                delete img.dataset.loadingStarted;
                 if (clearSrc && !img.classList.contains('loaded') && !img.classList.contains('error')) {
                     img.src = '';
                 }
-            }
-
-            function resetStaleLoadingImages() {
-                const now = Date.now();
-                visibleContent.querySelectorAll('img[data-src]').forEach(img => {
-                    if (img.classList.contains('loaded') || img.classList.contains('error')) return;
-                    const scheduledAt = Number(img.dataset.scheduledAt || 0);
-                    const loadingStarted = Number(img.dataset.loadingStarted || 0);
-                    const startTime = loadingStarted || scheduledAt;
-                    if (startTime && now - startTime > CONFIG.IMAGE_LOAD_STALE_TIMEOUT) {
-                        resetImageLoadState(img, true);
-                    }
-                });
             }
 
             function resetFailedImagesInCurrentDisplay() {
@@ -675,7 +663,7 @@
                 activeThumbnailTasks++;
                 
                 try {
-                    const result = await task();
+                    const result = await withTimeout(task(), 12000, 'Thumbnail generation timed out');
                     resolve(result);
                 } catch (err) {
                     reject(err);
@@ -688,7 +676,7 @@
                 }
             }
 
-            function cleanupAllResources({ cleanupLayoutListeners = false } = {}) {
+            function cleanupAllResources() {
                 clearImageLoadQueue();
 
                 if (scrollPauseTimer) {
@@ -709,11 +697,6 @@
                 isScrolling = false;
                 cleanupObjectUrls();
                 thumbnailCache.clear();
-
-                if (cleanupLayoutListeners && resizeObserver) {
-                    resizeObserver.disconnect();
-                    resizeObserver = null;
-                }
             }
             
             // ============================================================
@@ -1384,11 +1367,8 @@
             // scheduled 状态保存在 img.dataset.scheduled 中。
             // small 表示已进入小图 batch timer。
             // large 表示已进入大图加载/缩略图生成流程。
-            // scheduledAt 用于 stale loading 检查。
             function observeVisibleImages() {
                 const generation = loadGeneration;
-
-                resetStaleLoadingImages();
 
                 clearPendingImageBatchTimers();
 
@@ -1498,22 +1478,10 @@
                     return;
                 }
                 
-                const batchTimeout = setTimeout(() => {
-                    if (generation !== loadGeneration) return;
-                    console.warn('Batch loading timeout, clearing scheduled marks');
-                    validBatch.forEach(({ element }) => {
-                        resetImageLoadState(element, true);
-                    });
-                }, 15000);
-                
-                const promises = validBatch.map(({ element, data }) => 
+                validBatch.forEach(({ element, data }) => {
                     loadImageWithPlaceholder(element, data, generation).catch(err => {
-                        console.warn('Individual image load failed:', err);
-                    })
-                );
-                
-                Promise.allSettled(promises).finally(() => {
-                    clearTimeout(batchTimeout);
+                        log('warn', 'Individual image load failed:', err);
+                    });
                 });
             }
             
@@ -1572,17 +1540,13 @@
             }
 
             function waitImageElementLoaded(imgElement, imageUrl, imgData) {
-                return new Promise((resolve, reject) => {
-                    let timeout;
-
+                const loadPromise = new Promise((resolve, reject) => {
                     imgElement.onload = () => {
-                        clearTimeout(timeout);
                         log('info', '[OK] Image loaded successfully:', imgData.name);
                         resolve();
                     };
 
                     imgElement.onerror = () => {
-                        clearTimeout(timeout);
                         if (imgElement.complete && imgElement.naturalWidth > 0) {
                             resolve();
                         } else {
@@ -1591,21 +1555,13 @@
                         }
                     };
 
-                    imgElement.dataset.loadingStarted = String(Date.now());
                     imgElement.src = imageUrl;
-
-                    timeout = setTimeout(() => {
-                        if (imgElement.complete && imgElement.naturalWidth > 0) {
-                            resolve();
-                        } else {
-                            log('error', '[TIMEOUT] Load timeout:', imgData.name);
-                            reject(new Error('Load timeout'));
-                        }
-                    }, 30000);
                 });
+
+                return withTimeout(loadPromise, 15000, 'Image load timeout: ' + (imgData ? imgData.name : ''));
             }
 
-            async function loadImageWithPlaceholder(imgElement, imgData, generation = loadGeneration, retryCount = 0) {
+            async function loadImageWithPlaceholder(imgElement, imgData, generation = loadGeneration) {
                 if (generation !== loadGeneration) return;
                 if (!imgElement.isConnected) return;
                 if (imgElement.classList.contains('loaded') || imgElement.classList.contains('error')) {
@@ -1639,11 +1595,6 @@
                     
                     imgElement.src = '';
                     imgElement.removeAttribute('src');
-
-                    if (retryCount < 2) {
-                        await new Promise(resolve => setTimeout(resolve, 300 * (retryCount + 1)));
-                        return loadImageWithPlaceholder(imgElement, imgData, generation, retryCount + 1);
-                    }
 
                     showErrorState(imgElement, '加载失败（点击重试）', () => {
                         showRetryState(imgElement);
@@ -1799,7 +1750,7 @@
                 const img = list[idx];
                 let url;
                 try {
-                    url = await ensureImageObjectUrl(img);
+                    url = await withTimeout(ensureImageObjectUrl(img), 10000, '读取图片超时');
                 } catch (err) {
                     if (token === lightboxOpenToken) {
                         showToast('❌ 无法读取图片：' + err.message);
@@ -1955,7 +1906,7 @@
                 }
             }, { passive: false });
             
-            lightboxImgWrapper.addEventListener('touchend', (e) => {
+            lightboxImgWrapper.addEventListener('touchend', () => {
                 if (currentScale > 1) {
                     // 放大状态：结束平移
                     endPan();
@@ -2482,7 +2433,6 @@
             });
             
             // 优先使用 ResizeObserver，resize 事件作为降级方案并添加防抖
-            let resizeDebounceTimer = null;
             const handleResize = () => {
                 clearTimeout(resizeDebounceTimer);
                 resizeDebounceTimer = setTimeout(() => {
@@ -2515,19 +2465,6 @@
             setupDprListener();
             autoRestoreLastSession();
             
-            //  保存清理函数引用，用于页面卸载时移除 resize 监听器
-            const cleanupResizeListener = () => {
-                if (!window.ResizeObserver) {
-                    window.removeEventListener('resize', handleResize);
-                }
-            };
-            
-            // 页面卸载时清理所有资源，防止内存泄漏
-            window.addEventListener('beforeunload', () => {
-                cleanupResizeListener();
-                cleanupDprListener();
-                cleanupAllResources({ cleanupLayoutListeners: true });
-            });
         })();
     </script>
 </body>
