@@ -1053,6 +1053,7 @@
             }
 
             function renderTree(expandedPaths = null) {
+                const savedScrollTop = treeContainer.scrollTop;
                 const expanded = expandedPaths
                     ? new Set(expandedPaths.map(path => normalizePath(path || '')))
                     : new Set(getExpandedFolderPaths());
@@ -1077,6 +1078,9 @@
                 }
 
                 renderChildren(treeContainer, folderTree, 0);
+                if (savedScrollTop > 0) {
+                    treeContainer.scrollTop = savedScrollTop;
+                }
             }
 
             function ensureIncrementalFolderNode(path, handle, expandedPathSet) {
@@ -2185,6 +2189,7 @@
                 const removeSet = new Set();
                 const additions = [];
 
+                let hasModifications = false;
                 memoryFilesMap.forEach((memoryImage, locationKey) => {
                     const diskImage = diskFilesByLocation.get(locationKey);
                     if (!diskImage) {
@@ -2198,6 +2203,7 @@
                         memoryImage.handle = diskImage.handle;
                         memoryImage.size = diskImage.size;
                         memoryImage.modified = diskImage.modified;
+                        hasModifications = true;
                     } else {
                         memoryImage.handle = diskImage.handle;
                     }
@@ -2208,11 +2214,14 @@
                 });
 
                 if (currentGen !== scanGeneration) return false;
+                const hasStructureChanges = removeSet.size > 0 || additions.length > 0;
                 if (removeSet.size) allImages = allImages.filter(img => !removeSet.has(img));
                 if (additions.length) allImages.push(...additions);
-                rebuildAndRenderTree();
+                if (hasStructureChanges) {
+                    rebuildAndRenderTree();
+                }
 
-                if (activeFolder !== null && pathsOverlap(activeFolder, normalizedTarget)) {
+                if ((hasStructureChanges || hasModifications) && activeFolder !== null && pathsOverlap(activeFolder, normalizedTarget)) {
                     updateDisplay();
                 }
                 return true;
