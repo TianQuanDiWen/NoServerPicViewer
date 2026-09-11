@@ -339,8 +339,6 @@
             let renderedStartIndex = 0;
             let renderedEndIndex = 0;
             let resizeObserver = null;
-            let dprMediaQuery = null;
-            let dprMediaQueryHandler = null;
             let ticking = false;
             let currentScale = 1;
             let currentSort = 'date-desc';
@@ -409,46 +407,48 @@
                     this.maxSize = maxSize;
                     this.cache = new Map();
                 }
+
+                _safeRevoke(blobUrl) {
+                    // 原图 Object URL 由 objectUrlSet 统一纳管，缩略图 LRU 淘汰或清理时严禁销毁原图
+                    if (!blobUrl || objectUrlSet.has(blobUrl)) return;
+                    try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+                }
                 
                 get(cacheKey) {
                     if (!this.cache.has(cacheKey)) return null;
-                    const item = this.cache.get(cacheKey);
-                    item.lastAccess = Date.now();
-                    return item.blobUrl;
+                    const blobUrl = this.cache.get(cacheKey);
+                    this.cache.delete(cacheKey);
+                    this.cache.set(cacheKey, blobUrl);
+                    return blobUrl;
                 }
                 
                 set(cacheKey, blobUrl) {
                     if (this.cache.has(cacheKey)) {
+                        const oldBlobUrl = this.cache.get(cacheKey);
+                        if (oldBlobUrl && oldBlobUrl !== blobUrl) {
+                            this._safeRevoke(oldBlobUrl);
+                        }
                         this.cache.delete(cacheKey);
+                    } else if (this.cache.size >= this.maxSize) {
+                        const oldestKey = this.cache.keys().next().value;
+                        if (oldestKey !== undefined) this.delete(oldestKey);
                     }
-                    this.cache.set(cacheKey, { blobUrl, lastAccess: Date.now() });
-                    if (this.cache.size > this.maxSize) this.evict();
+                    this.cache.set(cacheKey, blobUrl);
                 }
                 
                 delete(cacheKey) {
                     if (this.cache.has(cacheKey)) {
-                        const item = this.cache.get(cacheKey);
-                        try { URL.revokeObjectURL(item.blobUrl); } catch (e) {}
+                        const blobUrl = this.cache.get(cacheKey);
+                        this._safeRevoke(blobUrl);
                         this.cache.delete(cacheKey);
                     }
                 }
                 
                 clear() {
-                    for (const [, item] of this.cache) {
-                        try { URL.revokeObjectURL(item.blobUrl); } catch (e) {}
+                    for (const [, blobUrl] of this.cache) {
+                        this._safeRevoke(blobUrl);
                     }
                     this.cache.clear();
-                }
-                
-                evict() {
-                    let oldestKey = null, oldestTime = Infinity;
-                    for (const [key, item] of this.cache) {
-                        if (item.lastAccess < oldestTime) {
-                            oldestTime = item.lastAccess;
-                            oldestKey = key;
-                        }
-                    }
-                    if (oldestKey) this.delete(oldestKey);
                 }
             }
 
@@ -480,8 +480,8 @@
             // 资源边界：
             // 原图 Object URL 由 ensureImageObjectUrl 创建，存入 imgData.url，并由 objectUrlSet 跟踪。
             // 原图 Object URL 由 cleanupObjectUrls / revokeObjectUrl 释放。
-            // 缩略图 Blob URL 由 generateThumbnailFromImage / atomicThumbnailTask 创建，存入 thumbnailCache。
-            // 缩略图 Blob URL 由 ThumbnailLRUCache.delete / clear / evict 释放，不应写入 imgData.url。
+            // 缩略图 Blob URL 由 generateThumbnailFromBlob / atomicThumbnailTask 创建，存入 thumbnailCache。
+            // 缩略图 Blob URL 由 ThumbnailLRUCache.delete / clear 释放，不应写入 imgData.url。
             // 只 revoke 已跟踪 URL；img.src 由加载生命周期单独处理
             function cleanupObjectUrls() {
                 objectUrlSet.forEach(url => {
@@ -507,69 +507,77 @@
             const MAX_CONCURRENT_THUMBNAIL_TASKS = 3;
             let thumbnailTaskQueue = [];
 
-            // 加载图片到内存
-            function loadImageToMemory(imageUrl) {
-                return new Promise((resolve, reject) => {
-                    const img = new Image();
-                    img.onload = () => resolve(img);
-                    img.onerror = () => reject(new Error('Failed to load image'));
-                    img.src = imageUrl;
-                });
-            }
-
-            // 从 Image 对象生成缩略图
-            async function generateThumbnailFromImage(img, maxWidth, maxHeight) {
-                const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
-                const width = Math.floor(img.width * scale);
-                const height = Math.floor(img.height * scale);
-                
-                const bitmap = await createImageBitmap(img, 0, 0, img.width, img.height, {
-                    resizeWidth: width,
-                    resizeHeight: height,
-                    resizeQuality: 'medium'
-                });
-                
-                const canvas = document.createElement('canvas');
-                canvas.width = width;
-                canvas.height = height;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(bitmap, 0, 0);
-                bitmap.close();
-                
-                return new Promise((resolve, reject) => {
-                    canvas.toBlob((blob) => {
-                        if (blob) {
-                            resolve(URL.createObjectURL(blob));
-                        } else {
-                            reject(new Error('Failed to create blob'));
-                        }
-                    }, 'image/jpeg', CONFIG.THUMBNAIL_QUALITY);
-                });
-            }
-
-            // 原子化任务：加载大图 → 生成缩略图 → 释放资源 → 返回缩略图URL
-            async function atomicThumbnailTask(imageUrl) {
-                // 步骤1：加载大图到内存
-                const fullImage = await loadImageToMemory(imageUrl);
-                
-                try {
-                    // 步骤2：生成缩略图
-                    const thumbnailBlobUrl = await generateThumbnailFromImage(
-                        fullImage, 
-                        CONFIG.THUMBNAIL_MAX_WIDTH, 
-                        CONFIG.THUMBNAIL_MAX_HEIGHT
-                    );
-                    
-                    // 步骤3：释放大图资源
-                    fullImage.src = '';
-                    
-                    // 步骤4：返回缩略图URL
-                    return thumbnailBlobUrl;
-                } catch (err) {
-                    // 确保异常时也释放资源
-                    fullImage.src = '';
-                    throw err;
+            // 从源对象解析可用于解码的 Blob（支持 File, Blob, FileSystemFileHandle, 或 blob URL）
+            async function resolveBlobFromSource(source, fallbackUrl) {
+                if (source instanceof Blob) return source;
+                if (source && typeof source.getFile === 'function') {
+                    try { return await source.getFile(); } catch (e) {}
                 }
+                if (source && source.handle && typeof source.handle.getFile === 'function') {
+                    try { return await source.handle.getFile(); } catch (e) {}
+                }
+                if (source && source.file instanceof Blob) {
+                    return source.file;
+                }
+                const url = (typeof source === 'string' && source) || fallbackUrl;
+                if (url && typeof url === 'string') {
+                    const resp = await fetch(url);
+                    return await resp.blob();
+                }
+                throw new Error('No valid blob source for thumbnail');
+            }
+
+            // 从 Blob 原生硬件缩放生成缩略图（由后台线程完成解码，Canvas 2D 直接硬件抗锯齿缩放，显存句柄由 finally 严格兜底释放）
+            async function generateThumbnailFromBlob(blob, maxWidth, maxHeight) {
+                let sourceBitmap = null;
+                try {
+                    sourceBitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+                } catch (e) {
+                    sourceBitmap = await createImageBitmap(blob);
+                }
+
+                try {
+                    const origWidth = sourceBitmap.width;
+                    const origHeight = sourceBitmap.height;
+                    const scale = Math.min(maxWidth / origWidth, maxHeight / origHeight, 1);
+                    const width = Math.max(1, Math.round(origWidth * scale));
+                    const height = Math.max(1, Math.round(origHeight * scale));
+
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    if (!ctx) {
+                        throw new Error('Failed to acquire 2D context for thumbnail canvas');
+                    }
+                    ctx.imageSmoothingEnabled = true;
+                    ctx.imageSmoothingQuality = 'medium';
+                    ctx.drawImage(sourceBitmap, 0, 0, width, height);
+
+                    return await new Promise((resolve, reject) => {
+                        canvas.toBlob((thumbBlob) => {
+                            if (thumbBlob) {
+                                resolve(URL.createObjectURL(thumbBlob));
+                            } else {
+                                reject(new Error('Failed to create blob'));
+                            }
+                        }, 'image/jpeg', CONFIG.THUMBNAIL_QUALITY);
+                    });
+                } finally {
+                    if (sourceBitmap) {
+                        try { sourceBitmap.close(); } catch (e) {}
+                    }
+                }
+            }
+
+            // 原子化任务：解析 Blob → 原生硬件缩放 → 返回缩略图URL
+            async function atomicThumbnailTask(source, imageUrl) {
+                const blob = await resolveBlobFromSource(source, imageUrl);
+                return await generateThumbnailFromBlob(
+                    blob,
+                    CONFIG.THUMBNAIL_MAX_WIDTH,
+                    CONFIG.THUMBNAIL_MAX_HEIGHT
+                );
             }
 
             // 调度一个缩略图生成任务（绑定对应 imgElement 用于视口感知和划出剔除）。
@@ -957,33 +965,6 @@
                 observeVisibleImages();
             }
 
-            function cleanupDprListener() {
-                if (!dprMediaQuery || !dprMediaQueryHandler) return;
-                if (typeof dprMediaQuery.removeEventListener === 'function') {
-                    dprMediaQuery.removeEventListener('change', dprMediaQueryHandler);
-                } else if (typeof dprMediaQuery.removeListener === 'function') {
-                    dprMediaQuery.removeListener(dprMediaQueryHandler);
-                }
-                dprMediaQuery = null;
-                dprMediaQueryHandler = null;
-            }
-
-            function setupDprListener() {
-                if (typeof window.matchMedia !== 'function') return;
-                cleanupDprListener();
-                const currentDpr = window.devicePixelRatio || 1;
-                dprMediaQuery = window.matchMedia(`(resolution: ${currentDpr}dppx)`);
-                dprMediaQueryHandler = () => {
-                    requestLayoutRefresh();
-                    setupDprListener();
-                };
-                if (typeof dprMediaQuery.addEventListener === 'function') {
-                    dprMediaQuery.addEventListener('change', dprMediaQueryHandler);
-                } else if (typeof dprMediaQuery.addListener === 'function') {
-                    dprMediaQuery.addListener(dprMediaQueryHandler);
-                }
-            }
-
             function buildFolderTree(images, rootFolderName = '') {
                 const root = createFolderNode(rootFolderName || '根目录', '', currentRootDirHandle);
                 images.forEach(img => {
@@ -1369,18 +1350,18 @@
             // 决定卡片最终展示 URL：小图使用原图 Object URL，大图优先使用缩略图 Blob URL。
             // 该函数不操作 DOM，不设置 img.src，也不处理重试和错误 UI。
             async function resolveDisplayImageUrl(imgData, generation, imgElement = null) {
-                const imageUrl = await ensureImageObjectUrl(imgData);
-
                 if (generation !== loadGeneration) {
                     return null;
                 }
 
-                if (!imageUrl || !imageUrl.startsWith('blob:')) {
-                    throw new Error('Invalid Object URL');
-                }
-
+                // 小图：直接按需获取原图 Object URL 并展示
                 if (!isLargeImageData(imgData)) {
                     log('debug', '[SMALL] Loading small image directly:', imgData.name);
+                    const imageUrl = await ensureImageObjectUrl(imgData);
+                    if (generation !== loadGeneration) return null;
+                    if (!imageUrl || !imageUrl.startsWith('blob:')) {
+                        throw new Error('Invalid Object URL');
+                    }
                     return imageUrl;
                 }
 
@@ -1397,8 +1378,9 @@
                 log('debug', '[THUMB] Generating thumbnail via task queue:', imgData.name);
 
                 try {
+                    // 大图直接传入 imgData 即可通过 FileHandle 获取底层 Blob，无需预先创建原图 Object URL
                     const thumbnailUrl = await scheduleThumbnailTask(imgElement, () =>
-                        atomicThumbnailTask(imageUrl)
+                        atomicThumbnailTask(imgData)
                     );
 
                     if (generation !== loadGeneration || !thumbnailUrl) {
@@ -1412,9 +1394,19 @@
                     log('debug', '[THUMB] Thumbnail generated successfully:', imgData.name);
                     return thumbnailUrl;
                 } catch (thumbErr) {
+                    // 如果任务因切代、划出视口或清空队列被取消，不作为失败降级，直接返回 null 供后续重新调度
+                    if (generation !== loadGeneration || thumbErr.message === 'cancelled' || thumbErr.message === 'image load queue cleared') {
+                        return null;
+                    }
+
                     log('warn', '[THUMB] Thumbnail generation failed, falling back to original:', imgData.name, thumbErr);
-                    thumbnailCache.set(thumbnailKey, imageUrl);
-                    return imageUrl;
+                    const fallbackUrl = await ensureImageObjectUrl(imgData);
+                    if (generation !== loadGeneration) return null;
+                    if (!fallbackUrl || !fallbackUrl.startsWith('blob:')) {
+                        throw new Error('Invalid Object URL');
+                    }
+                    thumbnailCache.set(thumbnailKey, fallbackUrl);
+                    return fallbackUrl;
                 }
             }
 
@@ -2398,7 +2390,6 @@
             updateDisplay();
             updateSyncButtonVisibility();
             updateSidebarToggleIcon();
-            setupDprListener();
             autoRestoreLastSession();
             
         })();
